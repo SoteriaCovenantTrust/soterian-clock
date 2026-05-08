@@ -107,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.6.0"
+WIDGET_VERSION = "2.6.1"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -544,6 +544,25 @@ class SoterianClock:
         # for unambiguous comparison.
         self.notice_text = ""
         self.notice_until = None
+
+        # Post-update success notice — compare WIDGET_VERSION to the version
+        # we ran with last time. If we upgraded since then (auto-update via
+        # tray, manual install of a new tarball, anything), raise a transient
+        # confirmation so the user knows the upgrade landed. The systemctl
+        # restart that auto-update triggers kills the in-flight "✓ Updated"
+        # notice from _do_self_update_thread, so this is the canonical signal.
+        last_seen = (self._settings.get("last_known_version") or "").strip()
+        if last_seen and last_seen != WIDGET_VERSION:
+            try:
+                if _ver_tuple(WIDGET_VERSION) > _ver_tuple(last_seen):
+                    self.notice_text = f"✓ Updated to v{WIDGET_VERSION} (was v{last_seen})"
+                    self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
+            except Exception:
+                pass
+        # Persist so the next startup can do the same comparison.
+        if last_seen != WIDGET_VERSION:
+            self._settings["last_known_version"] = WIDGET_VERSION
+            _safe_write_json(SETTINGS_PATH, self._settings)
 
         # Build UI
         self._build_ui()
