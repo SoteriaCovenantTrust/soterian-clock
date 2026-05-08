@@ -30,6 +30,12 @@ a = Analysis(
         'zoneinfo',
         'requests',
         'certifi',
+        # OS-keyring backends — keyring picks the right one at runtime per
+        # platform, so PyInstaller needs all three discoverable.
+        'keyring',
+        'keyring.backends.SecretService',  # Linux (libsecret)
+        'keyring.backends.macOS',           # macOS (Keychain)
+        'keyring.backends.Windows',         # Windows (Credential Locker)
     ],
     hookspath=[],
     hooksconfig={},

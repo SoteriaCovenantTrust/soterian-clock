@@ -34,6 +34,10 @@ import time
 import signal
 import threading
 import platform
+import shutil
+import subprocess
+import tarfile
+import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -83,12 +87,14 @@ TIMEZONE_CHOICES = [
     "Africa/Johannesburg", "Africa/Cairo",
 ]
 
-REFRESH_FAST = 60       # /api/date refresh interval (seconds)
-REFRESH_RICH = 300      # /api/now refresh interval (seconds)
-REFRESH_SYNC = 600      # Member sync interval (seconds)
+REFRESH_FAST = 60        # /api/date refresh interval (seconds)
+REFRESH_RICH = 300       # /api/now refresh interval (seconds)
+REFRESH_SYNC = 600       # Member sync interval (seconds)
+REFRESH_ALERTS = 14400   # Celestial-event check (4h — events don't change quickly)
 API_BASE = "https://time.soteriacovenant.org"
 API_DATE = f"{API_BASE}/api/date"
 API_NOW = f"{API_BASE}/api/now"
+API_MOBILE_SNAPSHOT = f"{API_BASE}/api/v1/mobile/snapshot"
 MEMBERSHIP_BASE = "https://members.soteriacovenant.org"
 MEMBERSHIP_WIDGET_CONNECT = f"{MEMBERSHIP_BASE}/api/v1/widget/connect"
 MEMBERSHIP_WIDGET_SYNC = f"{MEMBERSHIP_BASE}/api/v1/widget/sync"
@@ -100,7 +106,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.1.1"
+WIDGET_VERSION = "2.5.0"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -182,6 +188,94 @@ def _safe_write_text(path: Path, text: str) -> bool:
         return True
     except (OSError, IOError):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Widget-token storage — OS keyring with settings.json fallback
+# ---------------------------------------------------------------------------
+# v2.1.x stored the long-lived widget bearer token in plaintext at
+# ~/.config/soterian-clock/settings.json. From v2.2.0 on we use the OS keyring
+# (libsecret/SecretService on Linux, Keychain on macOS, Credential Locker on
+# Windows). On first launch after the upgrade, an existing legacy token in
+# settings.json is migrated into the keyring and removed from disk. If the
+# keyring isn't available (headless box without dbus, locked-down sandbox),
+# we fall back to settings.json so the widget keeps working — the security
+# improvement is best-effort, not a hard requirement.
+
+_KEYRING_SERVICE = "soterian-clock"
+_KEYRING_USER = "widget-token"
+
+
+def _keyring_module():
+    """Return the keyring module if importable, else None. Wrapped so we
+    don't pay the import cost on platforms/installs without keyring."""
+    try:
+        import keyring as _kr
+        return _kr
+    except ImportError:
+        return None
+
+
+def _load_widget_token() -> str:
+    """Read the widget token from the keyring; one-shot migrate from
+    settings.json if found there (legacy v2.1.x layout)."""
+    kr = _keyring_module()
+    if kr is not None:
+        try:
+            tok = kr.get_password(_KEYRING_SERVICE, _KEYRING_USER)
+            if tok:
+                return tok
+        except Exception:
+            pass
+
+    # Legacy fallback: settings.json
+    settings = _safe_read_json(SETTINGS_PATH, default={}) or {}
+    legacy = (settings.get("widget_token") or "").strip()
+    if legacy and kr is not None:
+        # Migrate to keyring + remove from settings.json
+        try:
+            kr.set_password(_KEYRING_SERVICE, _KEYRING_USER, legacy)
+            settings.pop("widget_token", None)
+            _safe_write_json(SETTINGS_PATH, settings)
+        except Exception:
+            pass  # Keep in settings.json if migration fails
+    return legacy
+
+
+def _save_widget_token(token: str) -> None:
+    """Persist the widget token. Prefers keyring; falls back to
+    settings.json if keyring is unavailable."""
+    kr = _keyring_module()
+    if kr is not None:
+        try:
+            kr.set_password(_KEYRING_SERVICE, _KEYRING_USER, token)
+            # Defensive: scrub any stale legacy copy
+            settings = _safe_read_json(SETTINGS_PATH, default={}) or {}
+            if "widget_token" in settings:
+                settings.pop("widget_token", None)
+                _safe_write_json(SETTINGS_PATH, settings)
+            return
+        except Exception:
+            pass
+    # Fallback: settings.json
+    settings = _safe_read_json(SETTINGS_PATH, default={}) or {}
+    settings["widget_token"] = token
+    _safe_write_json(SETTINGS_PATH, settings)
+
+
+def _delete_widget_token() -> None:
+    """Remove the widget token from both keyring AND settings.json — defensive
+    so a stale token can't reappear after re-connecting."""
+    kr = _keyring_module()
+    if kr is not None:
+        try:
+            kr.delete_password(_KEYRING_SERVICE, _KEYRING_USER)
+        except Exception:
+            pass
+    settings = _safe_read_json(SETTINGS_PATH, default={}) or {}
+    if "widget_token" in settings:
+        settings.pop("widget_token", None)
+        _safe_write_json(SETTINGS_PATH, settings)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +367,9 @@ def _create_tray_icon(clock_app):
     def on_open_almanac(icon, item):
         webbrowser.open(CELEBRATIONS_BASE)
 
+    def on_open_inbox(icon, item):
+        webbrowser.open(f"{MEMBERSHIP_BASE}/dashboard")
+
     def on_connect(icon, item):
         clock_app.root.after(0, clock_app._show_connect_dialog)
 
@@ -282,6 +379,9 @@ def _create_tray_icon(clock_app):
     def on_download_update(icon, item):
         url = clock_app.upgrade_releases_url or "https://github.com/SoteriaCovenantTrust/soterian-clock/releases"
         webbrowser.open(url)
+
+    def on_install_update(icon, item):
+        clock_app.root.after(0, clock_app.trigger_self_update)
 
     def on_quit(icon, item):
         icon.stop()
@@ -297,6 +397,13 @@ def _create_tray_icon(clock_app):
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Refresh Now", on_refresh),
         pystray.MenuItem("Open Almanac", on_open_almanac),
+        pystray.MenuItem(
+            lambda item: (f"📬 Open Inbox ({clock_app.inbox_unread} unread)"
+                          if clock_app.inbox_unread > 0
+                          else "📬 Open Inbox"),
+            on_open_inbox,
+            visible=lambda item: clock_app.is_connected,
+        ),
         pystray.MenuItem("Open time.soteriacovenant.org", on_open_site),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(
@@ -316,10 +423,18 @@ def _create_tray_icon(clock_app):
             visible=lambda item: not clock_app.is_connected,
         ),
         pystray.Menu.SEPARATOR,
+        # Install-now path (Linux only). We don't try to detect platform
+        # in pystray callable; instead, the action method itself returns a
+        # "this platform isn't supported" notice when called on Mac/Win.
         pystray.MenuItem(
-            lambda item: f"⬇  Download update (v{clock_app.upgrade_min_version}+)",
+            lambda item: f"⬇  Install update (v{clock_app.upgrade_latest_version})",
+            on_install_update,
+            visible=lambda item: bool(clock_app.upgrade_latest_version) and _SYSTEM == "Linux",
+        ),
+        pystray.MenuItem(
+            lambda item: f"\U0001F310  Open Releases page (v{clock_app.upgrade_latest_version})",
             on_download_update,
-            visible=lambda item: clock_app.upgrade_available,
+            visible=lambda item: bool(clock_app.upgrade_latest_version),
         ),
         pystray.MenuItem("Quit", on_quit),
     )
@@ -388,11 +503,23 @@ class SoterianClock:
         self.user_timezone = self._settings.get("timezone", "System Default")
 
         # Membership sync state
-        self.widget_token = self._settings.get("widget_token", "")
+        self.widget_token = _load_widget_token()
         self.member_alias = self._settings.get("member_alias", "")
         self.member_pma_id = self._settings.get("member_pma_id", "")
         self.member_tier = self._settings.get("member_tier", None)
         self.is_connected = bool(self.widget_token)
+        # Inbox unread counts — populated by /widget/sync. Renders as
+        # "📬 N" (or "📬 N ❗ K" when urgent > 0) in the dashbar so the
+        # always-visible widget doubles as an inbox badge for connected
+        # members. Cleared on disconnect.
+        self.inbox_unread = 0
+        self.inbox_urgent = 0
+        # Celestial-event alerts: opt-out via settings.json
+        # ("celestial_alerts": false). Tracks fingerprints of already-shown
+        # alerts so we don't re-notify on every 4h poll for the same event;
+        # bounded to 200 entries to keep settings.json from ballooning.
+        self.celestial_alerts_enabled = bool(self._settings.get("celestial_alerts", True))
+        self._seen_alerts = set(self._settings.get("seen_alerts", []) or [])
         # Tracks whether the most recent /widget/sync succeeded. Distinct from
         # is_online (calendar API health) so the status dot can surface
         # partial failure: green = both healthy, amber = calendar OK but
@@ -400,7 +527,8 @@ class SoterianClock:
         # not-yet-connected widget doesn't render amber on launch.
         self.is_member_online = True
         self.upgrade_available = False
-        self.upgrade_min_version = ""
+        self.upgrade_min_version = ""    # widgetMinVersionName (floor)
+        self.upgrade_latest_version = "" # widgetVersionName (target for auto-update)
         # Populated by the version handshake when the server provides
         # widgetReleasesUrl. Lets the tray + context menu show a "Download
         # Update" item that points at the real GitHub Releases page.
@@ -432,6 +560,9 @@ class SoterianClock:
         # surfaces an "Update available" indicator and the tray menu offers
         # a "Download Update" item pointing at widgetReleasesUrl.
         self._schedule_widget_version_check()
+
+        # Celestial-event alerts (4h cadence). Opt-out via settings.json.
+        self._schedule_celestial_alerts()
 
         # Start system tray
         self._start_tray()
@@ -514,6 +645,12 @@ class SoterianClock:
 
         self.context_menu.add_separator()
         self.context_menu.add_command(label="\U0001F4C5  Open Almanac", command=lambda: webbrowser.open(CELEBRATIONS_BASE))
+        if self.is_connected:
+            inbox_label = (f"\U0001F4EC  Open Inbox ({self.inbox_unread} unread)"
+                           if self.inbox_unread > 0
+                           else "\U0001F4EC  Open Inbox")
+            self.context_menu.add_command(label=inbox_label,
+                                          command=lambda: webbrowser.open(f"{MEMBERSHIP_BASE}/dashboard"))
         self.context_menu.add_command(label="\U0001F310  Open time.soteriacovenant.org", command=lambda: webbrowser.open(API_BASE))
         if self.upgrade_available:
             self.context_menu.add_separator()
@@ -617,10 +754,9 @@ class SoterianClock:
                     self.is_connected = False
                     self.is_member_online = False
                     self.widget_token = ""
-                    self._settings.pop("widget_token", None)
-                    _safe_write_json(SETTINGS_PATH, self._settings)
                     self.notice_text = "⚠ Membership connection revoked — reconnect via menu"
                     self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
+                _delete_widget_token()
                 # Rebuild context menu so it shows "Connect" not "Disconnect"
                 self.root.after(0, self._rebuild_context_menu)
                 self.root.after(0, self._update_display)
@@ -634,6 +770,11 @@ class SoterianClock:
                 self.member_tier = data.get("tier", self.member_tier)
                 self.is_connected = True
                 self.is_member_online = True
+                # Inbox badge — server v2.34.0+ adds these fields; older
+                # servers omit them, in which case .get returns 0 and the
+                # badge stays hidden.
+                self.inbox_unread = int(data.get("inbox_unread", 0) or 0)
+                self.inbox_urgent = int(data.get("inbox_urgent", 0) or 0)
                 # Sync timezone from membership if set
                 server_tz = data.get("timezone")
                 if server_tz and server_tz != self.user_timezone:
@@ -664,15 +805,28 @@ class SoterianClock:
             r.raise_for_status()
             data = r.json().get("data", {})
             min_v = (data.get("widgetMinVersionName") or "").strip()
+            latest_v = (data.get("widgetVersionName") or "").strip()
             releases_url = (data.get("widgetReleasesUrl") or "").strip()
+            # Trigger upgrade indicator if WE are below the floor OR below the latest.
+            # min_v gates the "you must upgrade" warning; latest_v drives the auto-
+            # update target so we install the newest available, not just the floor.
             if min_v and _ver_tuple(min_v) > _ver_tuple(WIDGET_VERSION):
                 with self._lock:
                     self.upgrade_available = True
                     self.upgrade_min_version = min_v
+                    self.upgrade_latest_version = latest_v or min_v
                     self.upgrade_releases_url = releases_url
-                # Rebuild menus so the "Download Update" item appears now.
                 self.root.after(0, self._rebuild_context_menu)
                 self.root.after(0, self._update_display)
+            elif latest_v and _ver_tuple(latest_v) > _ver_tuple(WIDGET_VERSION):
+                # Above the floor but a newer build is out — softer signal:
+                # the dashbar's "⚠ Update" warning is reserved for hard upgrades
+                # (below floor); newer-but-optional just enables the tray's
+                # "Install update now" item without nagging in the dashbar.
+                with self._lock:
+                    self.upgrade_latest_version = latest_v
+                    self.upgrade_releases_url = releases_url
+                self.root.after(0, self._rebuild_context_menu)
         except Exception:
             pass
 
@@ -682,6 +836,171 @@ class SoterianClock:
         upgrade prompt — v2.0.x checked once at startup and never again."""
         threading.Thread(target=self._fetch_widget_version, daemon=True).start()
         self.root.after(REFRESH_VERSION * 1000, self._schedule_widget_version_check)
+
+    def _fetch_celestial_alerts(self):
+        """Poll /api/v1/mobile/snapshot for upcoming celestial events. Filter
+        to high-priority + days_until ≤ 1 (today/tomorrow). Surface NEW ones
+        (fingerprint not in _seen_alerts) as a transient dashbar notice; track
+        the fingerprint so we don't re-fire on the next 4h poll for the same
+        event. Opt-out via settings.json `celestial_alerts: false`."""
+        if not self.celestial_alerts_enabled:
+            return
+        try:
+            r = requests.get(API_MOBILE_SNAPSHOT, timeout=15)
+            r.raise_for_status()
+            alerts = r.json().get("alerts") or []
+            new_for_user = []
+            for a in alerts:
+                if (a.get("priority") or "") != "high":
+                    continue
+                try:
+                    days = int(a.get("days_until", 999))
+                except (ValueError, TypeError):
+                    continue
+                if days > 1:
+                    continue
+                fp = f"{a.get('type', '')}|{a.get('body', '')}|{a.get('summary', '')}"
+                if fp in self._seen_alerts:
+                    continue
+                new_for_user.append((fp, a))
+
+            if new_for_user:
+                with self._lock:
+                    # Surface the FIRST new alert (snapshot returns roughly
+                    # chronological — earliest event first). Mark all as seen
+                    # so we don't queue notifications.
+                    a = new_for_user[0][1]
+                    self.notice_text = f"✨ {a.get('summary', '')}"
+                    self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
+                    for fp, _ in new_for_user:
+                        self._seen_alerts.add(fp)
+                    # Persist the seen-set, bounded to last 200 fingerprints
+                    # so settings.json stays small.
+                    seen_list = list(self._seen_alerts)
+                    if len(seen_list) > 200:
+                        seen_list = seen_list[-200:]
+                        self._seen_alerts = set(seen_list)
+                    self._settings["seen_alerts"] = seen_list
+                    _safe_write_json(SETTINGS_PATH, self._settings)
+                self.root.after(0, self._update_display)
+        except Exception:
+            pass
+
+    def _schedule_celestial_alerts(self):
+        """Run the celestial-alerts check immediately, then every
+        REFRESH_ALERTS seconds (4h). Cheap because the snapshot endpoint
+        returns a static-ish daily forecast."""
+        if self.celestial_alerts_enabled:
+            threading.Thread(target=self._fetch_celestial_alerts, daemon=True).start()
+        self.root.after(REFRESH_ALERTS * 1000, self._schedule_celestial_alerts)
+
+    # -------------------------------------------------------------------
+    # Self-update from the public Releases page
+    # -------------------------------------------------------------------
+
+    def trigger_self_update(self):
+        """User-initiated update. Runs the download/extract/swap/restart
+        flow on a background thread so the UI doesn't freeze; status is
+        surfaced via the dashbar notice mechanism."""
+        if not self.upgrade_latest_version:
+            return
+        threading.Thread(target=self._do_self_update_thread, daemon=True).start()
+        with self._lock:
+            self.notice_text = f"⏬ Downloading update v{self.upgrade_latest_version}..."
+            self.notice_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        self.root.after(0, self._update_display)
+
+    def _do_self_update_thread(self):
+        ok, msg = self._do_self_update(self.upgrade_latest_version)
+        with self._lock:
+            self.notice_text = ("✓ " if ok else "⚠ ") + msg
+            self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
+        self.root.after(0, self._update_display)
+
+    def _do_self_update(self, target_version: str):
+        """Linux-only: download the matching release tarball from the public
+        repo, extract, atomically swap the install dir, restart the systemd
+        user unit. Returns (ok: bool, message: str). The widget's running
+        process IS replaced by the systemctl restart, so this method
+        effectively never returns success — but if the swap fails before the
+        restart we surface the error.
+
+        Trust model: HTTPS to github.com (verifies the cert, which is good
+        enough for non-sensitive software). A SHA256-manifest-and-verify
+        step would tighten this; deferred to a future release."""
+        if _SYSTEM != "Linux":
+            return (False,
+                    f"Auto-install is Linux-only on this build. Open the Releases page to "
+                    f"download v{target_version} for {_SYSTEM}.")
+        arch = platform.machine()
+        if arch != "x86_64":
+            return (False,
+                    f"No matching x86_64 build for {arch}. Open the Releases page.")
+
+        url = (f"https://github.com/SoteriaCovenantTrust/soterian-clock/releases/download/"
+               f"v{target_version}/soterian-clock-{target_version}-linux-x86_64.tar.gz")
+
+        tarball_path = None
+        staging = None
+        try:
+            tarball_path = Path(tempfile.mkstemp(suffix=".tar.gz",
+                                                 prefix="soterian-clock-update-")[1])
+            with requests.get(url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(tarball_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+
+            staging = Path(tempfile.mkdtemp(prefix="soterian-clock-extract-"))
+            with tarfile.open(tarball_path) as tf:
+                tf.extractall(staging)
+
+            # Tarball lays out as soterian-clock/{soterian-clock binary, _internal/, ...}
+            new_dir = staging / "soterian-clock"
+            if not (new_dir / "soterian-clock").exists():
+                return (False, "Tarball missing expected binary; aborting.")
+
+            install_dir = Path.home() / ".local" / "share" / "soterian-clock"
+            bak_dir = install_dir.with_suffix(".bak")
+
+            # Defensive: clear any prior .bak so the rename succeeds.
+            if bak_dir.exists():
+                shutil.rmtree(bak_dir, ignore_errors=True)
+            if install_dir.exists():
+                install_dir.rename(bak_dir)
+            new_dir.rename(install_dir)
+
+            # Ensure the binary is executable post-extraction (PyInstaller
+            # bundles preserve it, but be defensive).
+            (install_dir / "soterian-clock").chmod(0o755)
+
+            # Restart the systemd user unit. systemctl --user only works
+            # when running under a user manager; if the widget was started
+            # some other way, restart fails benignly and the user can
+            # restart manually. Fire-and-forget — our own process is about
+            # to be replaced.
+            subprocess.Popen(
+                ["systemctl", "--user", "restart", "soterian-clock.service"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return (True, f"Updated to v{target_version}; restarting...")
+
+        except requests.HTTPError as e:
+            return (False, f"Download failed: {e.response.status_code} from {url}")
+        except requests.RequestException as e:
+            return (False, f"Network error during update: {e}")
+        except (tarfile.TarError, OSError) as e:
+            return (False, f"Extraction/install failed: {e}")
+        except Exception as e:
+            return (False, f"Update failed: {e!r}")
+        finally:
+            if tarball_path and tarball_path.exists():
+                try:
+                    tarball_path.unlink()
+                except OSError:
+                    pass
+            if staging and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
 
     def refresh_now(self):
         """Force an immediate refresh of all endpoints."""
@@ -771,6 +1090,14 @@ class SoterianClock:
             # Member alias (when connected)
             if self.is_connected and self.member_alias:
                 sections.append(f"\U0001F464 {self.member_alias}")
+
+            # Inbox badge — only when connected and there's actually unread.
+            # Urgent count is appended with ❗ when > 0.
+            if self.is_connected and self.inbox_unread > 0:
+                badge = f"\U0001F4EC {self.inbox_unread}"
+                if self.inbox_urgent > 0:
+                    badge += f" ❗ {self.inbox_urgent}"
+                sections.append(badge)
 
             # Soft "upgrade available" indicator (server pushed widgetMinVersionName
             # forward past our local WIDGET_VERSION)
@@ -945,14 +1272,15 @@ class SoterianClock:
                         if server_tz:
                             self.user_timezone = server_tz
 
-                        # Persist
-                        self._settings["widget_token"] = self.widget_token
+                        # Persist non-sensitive metadata to settings.json;
+                        # token goes to OS keyring (or settings.json fallback).
                         self._settings["member_alias"] = self.member_alias
                         self._settings["member_pma_id"] = self.member_pma_id
                         self._settings["member_tier"] = self.member_tier
                         if server_tz:
                             self._settings["timezone"] = server_tz
                         _safe_write_json(SETTINGS_PATH, self._settings)
+                    _save_widget_token(self.widget_token)
 
                     dialog.after(0, lambda: (dialog.destroy(), self._rebuild_context_menu(), self._update_display()))
 
@@ -1001,9 +1329,12 @@ class SoterianClock:
                 self.member_pma_id = ""
                 self.member_tier = None
                 self.is_connected = False
-                for key in ("widget_token", "member_alias", "member_pma_id", "member_tier"):
+                self.inbox_unread = 0
+                self.inbox_urgent = 0
+                for key in ("member_alias", "member_pma_id", "member_tier"):
                     self._settings.pop(key, None)
                 _safe_write_json(SETTINGS_PATH, self._settings)
+            _delete_widget_token()
             self.root.after(0, lambda: (self._rebuild_context_menu(), self._update_display()))
 
         threading.Thread(target=_do_disconnect, daemon=True).start()
@@ -1045,6 +1376,12 @@ class SoterianClock:
 
         self.context_menu.add_separator()
         self.context_menu.add_command(label="\U0001F4C5  Open Almanac", command=lambda: webbrowser.open(CELEBRATIONS_BASE))
+        if self.is_connected:
+            inbox_label = (f"\U0001F4EC  Open Inbox ({self.inbox_unread} unread)"
+                           if self.inbox_unread > 0
+                           else "\U0001F4EC  Open Inbox")
+            self.context_menu.add_command(label=inbox_label,
+                                          command=lambda: webbrowser.open(f"{MEMBERSHIP_BASE}/dashboard"))
         self.context_menu.add_command(label="\U0001F310  Open time.soteriacovenant.org", command=lambda: webbrowser.open(API_BASE))
         if self.upgrade_available:
             self.context_menu.add_separator()
