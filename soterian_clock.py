@@ -107,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.7.0"
+WIDGET_VERSION = "2.8.0"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -118,6 +118,76 @@ REFRESH_VERSION = 86400  # 24h
 # visible after being raised. Long enough that a user away-from-desk for
 # an hour still sees it on return.
 NOTICE_TTL = 3600  # 1h
+
+
+# ---------------------------------------------------------------------------
+# Lightweight i18n — scaffolding only as of v2.8.0
+# ---------------------------------------------------------------------------
+# Strings live in translations/{lang}.json next to this file (or in
+# _internal/translations/ inside the PyInstaller bundle). en.json is the
+# source-of-truth; missing keys in any other language fall back to English.
+# `_t("notice.connection_revoked")` returns the translated string;
+# `_t("tray.install_update", version="2.7.0")` does named-format substitution.
+#
+# Detection order:
+#   1. settings.json "language" key (manual override; e.g. "fr")
+#   2. LANG environment variable (e.g. "fr_CA.UTF-8" → "fr")
+#   3. "en"
+
+_TRANSLATIONS_CACHE: dict = {}
+
+
+def _translations_dir() -> Path:
+    """Find the translations dir whether running under PyInstaller or not."""
+    # Bundled mode: sys._MEIPASS / translations
+    bundled = getattr(sys, "_MEIPASS", None)
+    if bundled:
+        return Path(bundled) / "translations"
+    return Path(__file__).resolve().parent / "translations"
+
+
+def _detect_language() -> str:
+    settings = _safe_read_json(SETTINGS_PATH, default={}) or {}
+    pref = (settings.get("language") or "").strip()
+    if pref:
+        return pref
+    env = os.environ.get("LANG", "") or os.environ.get("LC_ALL", "")
+    if env:
+        # "fr_CA.UTF-8" → "fr"; ignore everything after _ or .
+        return env.split(".")[0].split("_")[0].lower() or "en"
+    return "en"
+
+
+def _load_translations(lang: str) -> dict:
+    if lang in _TRANSLATIONS_CACHE:
+        return _TRANSLATIONS_CACHE[lang]
+    path = _translations_dir() / f"{lang}.json"
+    data = _safe_read_json(path, default={}) or {}
+    _TRANSLATIONS_CACHE[lang] = data
+    return data
+
+
+def _t(key: str, **kwargs) -> str:
+    """Translate a dotted key (e.g. "tray.show_clock") to the user's
+    language; fall back to English; final fallback is the key itself.
+    Named substitutions via .format(**kwargs)."""
+    lang = _detect_language()
+    for source in (lang, "en"):
+        data = _load_translations(source)
+        node = data
+        for part in key.split("."):
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(part)
+            if node is None:
+                break
+        if isinstance(node, str):
+            try:
+                return node.format(**kwargs)
+            except (KeyError, IndexError):
+                return node
+    return key  # truly missing — leak the key so it's debuggable
 
 
 def _ver_tuple(v: str) -> tuple:
@@ -411,14 +481,16 @@ def _create_tray_icon(clock_app):
     )
 
     menu = pystray.Menu(
-        pystray.MenuItem("Show Clock", on_show, default=True),
-        pystray.MenuItem("Hide Clock", on_hide),
+        pystray.MenuItem(lambda item: _t("tray.show_clock"), on_show, default=True),
+        pystray.MenuItem(lambda item: _t("tray.hide_clock"), on_hide),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Refresh Now", on_refresh),
+        pystray.MenuItem(lambda item: _t("tray.refresh_now"), on_refresh),
         pystray.MenuItem(
-            lambda item: (f"\U0001F30D  Open Soteria sites ({clock_app.inbox_unread})"
-                          if (clock_app.is_connected and clock_app.inbox_unread > 0)
-                          else "\U0001F30D  Open Soteria sites"),
+            lambda item: ("\U0001F30D  " + (
+                _t("tray.open_sites_with_unread", count=clock_app.inbox_unread)
+                if (clock_app.is_connected and clock_app.inbox_unread > 0)
+                else _t("tray.open_sites")
+            )),
             None,
             sites_submenu,
         ),
@@ -454,8 +526,8 @@ def _create_tray_icon(clock_app):
             visible=lambda item: bool(clock_app.upgrade_latest_version),
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lambda item: f"About v{WIDGET_VERSION}", on_about),
-        pystray.MenuItem("Quit", on_quit),
+        pystray.MenuItem(lambda item: _t("tray.about", version=WIDGET_VERSION), on_about),
+        pystray.MenuItem(lambda item: _t("tray.quit"), on_quit),
     )
 
     icon = pystray.Icon("soterian-clock", img, "Petrachora Soteria Clock", menu)
@@ -568,7 +640,7 @@ class SoterianClock:
         if last_seen and last_seen != WIDGET_VERSION:
             try:
                 if _ver_tuple(WIDGET_VERSION) > _ver_tuple(last_seen):
-                    self.notice_text = f"✓ Updated to v{WIDGET_VERSION} (was v{last_seen})"
+                    self.notice_text = _t("notice.updated_from", new=WIDGET_VERSION, old=last_seen)
                     self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
             except Exception:
                 pass
@@ -792,7 +864,7 @@ class SoterianClock:
                     self.is_connected = False
                     self.is_member_online = False
                     self.widget_token = ""
-                    self.notice_text = "⚠ Membership connection revoked — reconnect via menu"
+                    self.notice_text = _t("notice.connection_revoked")
                     self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
                 _delete_widget_token()
                 # Rebuild context menu so it shows "Connect" not "Disconnect"
@@ -944,7 +1016,7 @@ class SoterianClock:
             return
         threading.Thread(target=self._do_self_update_thread, daemon=True).start()
         with self._lock:
-            self.notice_text = f"⏬ Downloading update v{self.upgrade_latest_version}..."
+            self.notice_text = _t("notice.downloading_update", version=self.upgrade_latest_version)
             self.notice_until = datetime.now(timezone.utc) + timedelta(minutes=5)
         self.root.after(0, self._update_display)
 

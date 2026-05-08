@@ -18,7 +18,12 @@ a = Analysis(
     [os.path.join(src_dir, 'soterian_clock.py')],
     pathex=[src_dir],
     binaries=[],
-    datas=[],
+    datas=[
+        # Bundle the translations dir so the runtime _t() helper can find
+        # locale files. en.json is the source-of-truth fallback; other
+        # locales are layered on top via _detect_language().
+        (os.path.join(src_dir, 'translations'), 'translations'),
+    ],
     hiddenimports=[
         'pystray',
         'pystray._xorg',    # Linux
