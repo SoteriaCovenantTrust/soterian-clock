@@ -47,6 +47,60 @@ echo ""
 echo "Build successful!"
 ls -lh dist/soterian-clock/soterian-clock* 2>/dev/null
 
+# ---------------------------------------------------------------------------
+# Post-build trim — PyInstaller bundles a lot we don't need
+# ---------------------------------------------------------------------------
+# pystray's GTK appindicator backend pulls in gdk-pixbuf, which pulls in
+# every loader (including AV1/JXL/SVG codecs we never decode), every icon
+# theme on the system (Papirus, Adwaita), and animated cursor frames.
+# A 4.7 MB binary should not require a 500 MB bundle. We trim aggressively
+# but conservatively — only stuff we KNOW the widget doesn't use.
+
+INTERNAL="dist/soterian-clock/_internal"
+if [ -d "$INTERNAL" ]; then
+    BEFORE_KB=$(du -sk "dist/soterian-clock" 2>/dev/null | awk '{print $1}')
+
+    # Image/video codec libs pulled in by gdk-pixbuf loaders. We use
+    # exactly one PNG (the tray icon) — none of these are reachable.
+    for lib in libSvtAv1Enc libaom librav1e librsvg-2 libjxl libdav1d libde265 \
+               libheif libavif libwebp libwebpmux libwebpdemux \
+               libgif libtiff libjasper libopenjp2; do
+        find "$INTERNAL" -maxdepth 1 -type f -name "${lib}.so*" -delete 2>/dev/null || true
+    done
+
+    # GTK icon theme caches + animated cursor frames. The tray icon is
+    # rendered from our own PIL Image, not pulled from a theme — these
+    # are dead weight. We keep the theme dirs themselves (some hooks
+    # check for existence) but evict the heavy data inside.
+    rm -rf "$INTERNAL/share/icons/Papirus" "$INTERNAL/share/icons/Papirus-Dark" \
+           "$INTERNAL/share/icons/Papirus-Light" 2>/dev/null || true
+    rm -rf "$INTERNAL/share/icons/Adwaita/cursors" 2>/dev/null || true
+    # Other icon themes pulled in (Tango, gnome, etc.) — same reasoning.
+    for theme in Tango gnome Humanity hicolor-fallback Faenza HighContrast Mint-X breeze-cursors; do
+        rm -rf "$INTERNAL/share/icons/$theme" 2>/dev/null || true
+    done
+
+    # Locale data we don't ship UI strings for. Keep `en` only; the widget's
+    # own UI is English-only as of v2.6.x. (Localization scaffolding tracked
+    # separately; until that lands, every other locale dir is unused.)
+    if [ -d "$INTERNAL/share/locale" ]; then
+        find "$INTERNAL/share/locale" -mindepth 1 -maxdepth 1 -type d \
+             ! -name "en" ! -name "en_US" ! -name "C" -exec rm -rf {} + 2>/dev/null || true
+    fi
+
+    # gdk-pixbuf loaders for codecs we just deleted (avoids load-time
+    # warnings about missing loaders we don't want anyway).
+    find "$INTERNAL" -path "*gdk-pixbuf*loaders*" -name "*.so" \
+         \( -name "*svg*" -o -name "*tiff*" -o -name "*webp*" -o -name "*jxl*" \
+            -o -name "*avif*" -o -name "*heif*" -o -name "*jp2*" \) \
+         -delete 2>/dev/null || true
+
+    AFTER_KB=$(du -sk "dist/soterian-clock" 2>/dev/null | awk '{print $1}')
+    SAVED_KB=$(( BEFORE_KB - AFTER_KB ))
+    echo ""
+    echo "Trim:     $((BEFORE_KB / 1024)) MB -> $((AFTER_KB / 1024)) MB  (saved $((SAVED_KB / 1024)) MB)"
+fi
+
 # Package
 echo ""
 echo "Packaging..."

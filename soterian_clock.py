@@ -107,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.6.1"
+WIDGET_VERSION = "2.7.0"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -395,20 +395,33 @@ def _create_tray_icon(clock_app):
     # cheaper than rebuilding the icon on every state change, and pystray
     # re-evaluates `text=`, `visible=`, and `checked=` callables each time
     # the menu opens.
+    # "Open ..." items collapse into a submenu so the top-level tray menu
+    # stays scannable. The Inbox label still carries the unread count so a
+    # member doesn't need to expand the submenu to see "you have 3 unread".
+    sites_submenu = pystray.Menu(
+        pystray.MenuItem("\U0001F4C5  Almanac", on_open_almanac),
+        pystray.MenuItem(
+            lambda item: (f"\U0001F4EC  Inbox ({clock_app.inbox_unread} unread)"
+                          if clock_app.inbox_unread > 0
+                          else "\U0001F4EC  Inbox"),
+            on_open_inbox,
+            visible=lambda item: clock_app.is_connected,
+        ),
+        pystray.MenuItem("\U0001F551  time.soteriacovenant.org", on_open_site),
+    )
+
     menu = pystray.Menu(
         pystray.MenuItem("Show Clock", on_show, default=True),
         pystray.MenuItem("Hide Clock", on_hide),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Refresh Now", on_refresh),
-        pystray.MenuItem("Open Almanac", on_open_almanac),
         pystray.MenuItem(
-            lambda item: (f"📬 Open Inbox ({clock_app.inbox_unread} unread)"
-                          if clock_app.inbox_unread > 0
-                          else "📬 Open Inbox"),
-            on_open_inbox,
-            visible=lambda item: clock_app.is_connected,
+            lambda item: (f"\U0001F30D  Open Soteria sites ({clock_app.inbox_unread})"
+                          if (clock_app.is_connected and clock_app.inbox_unread > 0)
+                          else "\U0001F30D  Open Soteria sites"),
+            None,
+            sites_submenu,
         ),
-        pystray.MenuItem("Open time.soteriacovenant.org", on_open_site),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(
             lambda item: f"Connected: {clock_app.member_alias or clock_app.member_pma_id}",
@@ -1618,7 +1631,53 @@ def run_clock(start_hidden=False):
     root.mainloop()
 
 
+def _cli_upgrade() -> int:
+    """Headless self-update path. Probes /api/v1/version for the latest
+    widgetVersionName, runs the same download → SHA256-verify → atomic-swap
+    → systemctl restart flow as the tray "Install update" item, but without
+    a Tk root or the dashbar. Useful for `cron`, packaging scripts, or a
+    user who just wants to upgrade from a terminal.
+
+    Exit codes:
+      0 — already up to date OR successfully launched the update
+      1 — version probe failed
+      2 — update flow failed (download / hash / swap)
+    """
+    try:
+        r = requests.get(MEMBERSHIP_VERSION, timeout=15)
+        r.raise_for_status()
+        data = r.json().get("data", {})
+        latest = (data.get("widgetVersionName") or "").strip()
+    except Exception as e:
+        print(f"soterian-clock --upgrade: version probe failed: {e}", file=sys.stderr)
+        return 1
+    if not latest:
+        print(f"soterian-clock --upgrade: no widgetVersionName from {MEMBERSHIP_VERSION}",
+              file=sys.stderr)
+        return 1
+    if _ver_tuple(latest) <= _ver_tuple(WIDGET_VERSION):
+        print(f"soterian-clock --upgrade: already at v{WIDGET_VERSION} "
+              f"(latest is v{latest}). Nothing to do.")
+        return 0
+
+    print(f"soterian-clock --upgrade: v{WIDGET_VERSION} → v{latest} ...")
+
+    # Re-use the SoterianClock._do_self_update method without instantiating
+    # the full widget (no Tk root). The method only touches `self` for
+    # logging; we pass a stub via __new__.
+    stub = SoterianClock.__new__(SoterianClock)
+    ok, msg = stub._do_self_update(latest)
+    print(msg)
+    return 0 if ok else 2
+
+
 if __name__ == "__main__":
+    # Headless --upgrade short-circuits before any Tk / lockfile dance —
+    # it's safe to run while the regular widget is also running, since
+    # the systemctl restart at the end will swap in the new binary.
+    if "--upgrade" in sys.argv:
+        sys.exit(_cli_upgrade())
+
     if already_running():
         print("Soterian Clock is already running.")
         sys.exit(0)
