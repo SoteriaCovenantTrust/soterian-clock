@@ -187,6 +187,16 @@ jobs:
       - name: List artifacts
         run: find artifacts -type f | sort
 
+      - name: Generate SHA256SUMS
+        # Standard `sha256sum` output: "<64-hex>  <filename>". The widget
+        # auto-update flow fetches this file, finds the line matching its
+        # platform tarball, and verifies the download before extraction.
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -215,5 +225,6 @@ jobs:
             See [CHANGELOG.md](https://github.com/SoteriaCovenantTrust/soterian-clock/blob/main/CHANGELOG.md).
           files: |
             artifacts/**/*
+            artifacts/SHA256SUMS
           draft: false
           prerelease: false
