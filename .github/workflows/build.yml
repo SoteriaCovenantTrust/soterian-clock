@@ -1,0 +1,219 @@
+name: Build Soterian Clock
+
+# Tag a release like `v2.1.0` to trigger a matrix build that publishes
+# Linux + macOS + Windows archives to a GitHub Release. workflow_dispatch
+# also available for manual builds during development.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 2.0.3)'
+        required: true
+        default: '2.0.3'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x86_64
+            artifact: soterian-clock
+          - os: windows-latest
+            platform: windows
+            arch: x64
+            artifact: soterian-clock.exe
+          - os: macos-latest
+            platform: macos
+            arch: arm64
+            artifact: soterian-clock
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Install Linux GUI deps
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk libgirepository1.0-dev gir1.2-ayatanaappindicator3-0.1
+
+      - name: Build with PyInstaller
+        run: python -m PyInstaller installer/soterian_clock.spec --noconfirm --clean
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            # Extract from tag: v2.0.3 -> 2.0.3
+            TAG="${{ github.ref_name }}"
+            echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Add Linux install script (systemd user unit, not XDG autostart)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          cat > dist/soterian-clock/install.sh << 'INSTALLER'
+          #!/usr/bin/env bash
+          # Soterian Clock — Linux Installer.
+          # Wires a systemd user unit instead of XDG autostart so the widget
+          # is supervised (Restart=on-failure) and its stderr is captured to
+          # journald — the v1 widget died silently for 3 weeks in April 2026
+          # because XDG autostart had no supervisor and no log capture.
+          set -euo pipefail
+
+          INSTALL_DIR="$HOME/.local/share/soterian-clock"
+          BIN_LINK="$HOME/.local/bin/soterian-clock"
+          SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+          OLD_AUTOSTART="$HOME/.config/autostart/soterian-clock.desktop"
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+          echo "Installing Soterian Clock..."
+
+          mkdir -p "$INSTALL_DIR"
+          cp -r "$SCRIPT_DIR"/* "$INSTALL_DIR/"
+          chmod +x "$INSTALL_DIR/soterian-clock"
+          rm -f "$INSTALL_DIR/install.sh"
+
+          mkdir -p "$(dirname "$BIN_LINK")"
+          ln -sf "$INSTALL_DIR/soterian-clock" "$BIN_LINK"
+
+          mkdir -p "$SYSTEMD_USER_DIR"
+          cat > "$SYSTEMD_USER_DIR/soterian-clock.service" << EOF
+          [Unit]
+          Description=Soterian Floating Clock Widget
+          PartOf=graphical-session.target
+          After=graphical-session.target
+
+          [Service]
+          Type=simple
+          ExecStart=$INSTALL_DIR/soterian-clock
+          Restart=on-failure
+          RestartSec=30
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=soterian-clock
+
+          [Install]
+          WantedBy=graphical-session.target
+          EOF
+
+          if [ -f "$OLD_AUTOSTART" ]; then
+            mv "$OLD_AUTOSTART" "$OLD_AUTOSTART.bak"
+            echo "Retired old XDG autostart: $OLD_AUTOSTART -> ${OLD_AUTOSTART}.bak"
+          fi
+
+          systemctl --user daemon-reload
+          systemctl --user enable --now soterian-clock.service
+
+          echo ""
+          echo "Installed to:  $INSTALL_DIR"
+          echo "Symlink:       $BIN_LINK"
+          echo "Systemd unit:  $SYSTEMD_USER_DIR/soterian-clock.service"
+          echo ""
+          echo "The widget is running and will start automatically on each login."
+          echo "  Status:  systemctl --user status soterian-clock"
+          echo "  Logs:    journalctl --user -u soterian-clock -f"
+          echo "  Stop:    systemctl --user disable --now soterian-clock"
+          INSTALLER
+          chmod +x dist/soterian-clock/install.sh
+
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          chmod -R a+rX dist/soterian-clock/
+          chmod a+x dist/soterian-clock/soterian-clock
+          tar --owner=0 --group=0 -czf \
+            "dist/soterian-clock-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz" \
+            -C dist soterian-clock
+
+      - name: Package (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\soterian-clock -DestinationPath `
+            "dist\soterian-clock-${{ steps.version.outputs.version }}-windows-x64.zip"
+
+      - name: Package (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          cd dist && zip -r \
+            "soterian-clock-${{ steps.version.outputs.version }}-macos-arm64.zip" \
+            soterian-clock
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: soterian-clock-${{ matrix.platform }}
+          path: |
+            dist/soterian-clock-*.tar.gz
+            dist/soterian-clock-*.zip
+          retention-days: 90
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Soterian Clock ${{ github.ref_name }}"
+          body: |
+            ## Soterian Clock ${{ github.ref_name }}
+
+            Cross-platform desktop widget for the Petrachora Soteria calendar.
+
+            ### Install
+
+            **Linux:**
+            ```bash
+            tar -xzf soterian-clock-*-linux-x86_64.tar.gz
+            cd soterian-clock
+            ./install.sh
+            ```
+            Wires a systemd user unit (Restart=on-failure + journal capture).
+
+            **Windows:** Extract the zip and run `soterian-clock.exe`.
+
+            **macOS:** Extract the zip and move `soterian-clock` to `/Applications`.
+
+            ### Changelog
+
+            See [CHANGELOG.md](https://github.com/SoteriaCovenantTrust/soterian-clock/blob/main/CHANGELOG.md).
+          files: |
+            artifacts/**/*
+          draft: false
+          prerelease: false
