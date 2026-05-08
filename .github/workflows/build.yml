@@ -19,7 +19,25 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    # Linux-only unit tests for the parts that don't need a Tk display.
+    # Gates the matrix build — a tag push that fails tests doesn't ship a
+    # GitHub Release.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Run pytest
+        run: python -m pytest tests/ -v
+
   build:
+    needs: test
     strategy:
       matrix:
         include:
