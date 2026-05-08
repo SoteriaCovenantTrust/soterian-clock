@@ -34,7 +34,7 @@ import time
 import signal
 import threading
 import platform
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -95,11 +95,22 @@ MEMBERSHIP_WIDGET_SYNC = f"{MEMBERSHIP_BASE}/api/v1/widget/sync"
 MEMBERSHIP_WIDGET_TIMEZONE = f"{MEMBERSHIP_BASE}/api/v1/widget/timezone"
 MEMBERSHIP_WIDGET_DISCONNECT = f"{MEMBERSHIP_BASE}/api/v1/widget/disconnect"
 MEMBERSHIP_VERSION = f"{MEMBERSHIP_BASE}/api/v1/version"
+CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.0.3"
+WIDGET_VERSION = "2.1.1"
+
+# How often to re-poll /api/v1/version. A widget left running for weeks
+# would never see the upgrade prompt without this, since the v2 launch-time
+# handshake fires once and never repeats.
+REFRESH_VERSION = 86400  # 24h
+
+# How long a transient dashbar notice (e.g. "Connection revoked") stays
+# visible after being raised. Long enough that a user away-from-desk for
+# an hour still sees it on return.
+NOTICE_TTL = 3600  # 1h
 
 
 def _ver_tuple(v: str) -> tuple:
@@ -259,17 +270,57 @@ def _create_tray_icon(clock_app):
     def on_open_site(icon, item):
         webbrowser.open(API_BASE)
 
+    def on_open_almanac(icon, item):
+        webbrowser.open(CELEBRATIONS_BASE)
+
+    def on_connect(icon, item):
+        clock_app.root.after(0, clock_app._show_connect_dialog)
+
+    def on_disconnect(icon, item):
+        clock_app.root.after(0, clock_app._disconnect_membership)
+
+    def on_download_update(icon, item):
+        url = clock_app.upgrade_releases_url or "https://github.com/SoteriaCovenantTrust/soterian-clock/releases"
+        webbrowser.open(url)
+
     def on_quit(icon, item):
         icon.stop()
         clock_app.root.after(0, clock_app.quit_app)
 
+    # Dynamic menu items inspect clock_app state at popup time. This is
+    # cheaper than rebuilding the icon on every state change, and pystray
+    # re-evaluates `text=`, `visible=`, and `checked=` callables each time
+    # the menu opens.
     menu = pystray.Menu(
         pystray.MenuItem("Show Clock", on_show, default=True),
         pystray.MenuItem("Hide Clock", on_hide),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Refresh Now", on_refresh),
-        pystray.MenuItem("Open Website", on_open_site),
+        pystray.MenuItem("Open Almanac", on_open_almanac),
+        pystray.MenuItem("Open time.soteriacovenant.org", on_open_site),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            lambda item: f"Connected: {clock_app.member_alias or clock_app.member_pma_id}",
+            None,
+            enabled=False,
+            visible=lambda item: clock_app.is_connected,
+        ),
+        pystray.MenuItem(
+            "Disconnect from Membership",
+            on_disconnect,
+            visible=lambda item: clock_app.is_connected,
+        ),
+        pystray.MenuItem(
+            "Connect to Membership...",
+            on_connect,
+            visible=lambda item: not clock_app.is_connected,
+        ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            lambda item: f"⬇  Download update (v{clock_app.upgrade_min_version}+)",
+            on_download_update,
+            visible=lambda item: clock_app.upgrade_available,
+        ),
         pystray.MenuItem("Quit", on_quit),
     )
 
@@ -291,6 +342,28 @@ class SoterianClock:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=BG_COLOR)
+
+        # HiDPI awareness — must run before any widget is built so font
+        # sizes (specified in points) get the right point-to-pixel ratio.
+        # Tk defaults to ~96 DPI; on a HiDPI display under Wayland with
+        # mutter's xwayland-native-scaling enabled (GNOME default for some
+        # configs as of 2026), the X11 server reports the true native
+        # resolution and Tk renders the dashbar roughly half-size unless
+        # we apply the scale ourselves. We honour an explicit override in
+        # settings.json ("ui_scale") for users who want to force a value;
+        # otherwise we infer from winfo_fpixels and only scale up if the
+        # screen is meaningfully HiDPI (>120 DPI).
+        try:
+            override = float(_safe_read_json(SETTINGS_PATH, default={}).get("ui_scale") or 0)
+            if override > 0:
+                self.root.tk.call('tk', 'scaling', override)
+            else:
+                ppi = self.root.winfo_fpixels('1i')  # pixels per inch
+                if ppi > 120:
+                    self.root.tk.call('tk', 'scaling', ppi / 72.0)
+        except Exception as e:
+            print(f"[soterian-clock] HiDPI scaling probe failed: {e!r}",
+                  file=sys.stderr, flush=True)
 
         # Thin dashbar strip — auto-width, fixed height
         self.root.resizable(False, False)
@@ -328,6 +401,15 @@ class SoterianClock:
         self.is_member_online = True
         self.upgrade_available = False
         self.upgrade_min_version = ""
+        # Populated by the version handshake when the server provides
+        # widgetReleasesUrl. Lets the tray + context menu show a "Download
+        # Update" item that points at the real GitHub Releases page.
+        self.upgrade_releases_url = ""
+        # Transient notice surfaced in the dashbar (e.g. token-revoked).
+        # Cleared automatically after NOTICE_TTL. Stored as a UTC datetime
+        # for unambiguous comparison.
+        self.notice_text = ""
+        self.notice_until = None
 
         # Build UI
         self._build_ui()
@@ -345,10 +427,11 @@ class SoterianClock:
         self._schedule_rich_fetch()
         self._schedule_member_sync()
 
-        # One-shot version handshake against Membership /api/v1/version.
+        # Periodic version handshake against Membership /api/v1/version.
         # If the server says we're below widgetMinVersionName, the dashbar
-        # surfaces an "Update available" indicator.
-        threading.Thread(target=self._fetch_widget_version, daemon=True).start()
+        # surfaces an "Update available" indicator and the tray menu offers
+        # a "Download Update" item pointing at widgetReleasesUrl.
+        self._schedule_widget_version_check()
 
         # Start system tray
         self._start_tray()
@@ -430,7 +513,15 @@ class SoterianClock:
             )
 
         self.context_menu.add_separator()
-        self.context_menu.add_command(label="\U0001F310  Open Website", command=lambda: webbrowser.open(API_BASE))
+        self.context_menu.add_command(label="\U0001F4C5  Open Almanac", command=lambda: webbrowser.open(CELEBRATIONS_BASE))
+        self.context_menu.add_command(label="\U0001F310  Open time.soteriacovenant.org", command=lambda: webbrowser.open(API_BASE))
+        if self.upgrade_available:
+            self.context_menu.add_separator()
+            self.context_menu.add_command(
+                label=f"\u2b07  Download update (v{self.upgrade_min_version}+)",
+                command=lambda: webbrowser.open(self.upgrade_releases_url
+                                                or "https://github.com/SoteriaCovenantTrust/soterian-clock/releases"),
+            )
         self.context_menu.add_separator()
         self.context_menu.add_command(label="\u2715  Quit", command=self.quit_app)
 
@@ -509,7 +600,9 @@ class SoterianClock:
 
         Sets is_member_online so the status dot can distinguish between
         calendar-API failure (red) and member-sync failure (amber). On
-        token-revoked (401) we clear the connection entirely; on transient
+        token-revoked (401) we clear the connection entirely AND raise a
+        transient dashbar notice so the user knows their connection just
+        broke (otherwise the alias would silently disappear); on transient
         network failure we keep the connection but mark the sync stale."""
         if not self.widget_token:
             return
@@ -526,6 +619,10 @@ class SoterianClock:
                     self.widget_token = ""
                     self._settings.pop("widget_token", None)
                     _safe_write_json(SETTINGS_PATH, self._settings)
+                    self.notice_text = "⚠ Membership connection revoked — reconnect via menu"
+                    self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
+                # Rebuild context menu so it shows "Connect" not "Disconnect"
+                self.root.after(0, self._rebuild_context_menu)
                 self.root.after(0, self._update_display)
                 return
 
@@ -556,23 +653,35 @@ class SoterianClock:
         self.root.after(REFRESH_SYNC * 1000, self._schedule_member_sync)
 
     def _fetch_widget_version(self):
-        """One-shot version handshake. Asks Membership /api/v1/version what the
-        minimum supported widget version is; if we're below it, sets
-        upgrade_available so the dashbar can surface the warning. Failures are
-        silent — version drift is non-urgent and a missing handshake shouldn't
-        block startup."""
+        """Version handshake. Asks Membership /api/v1/version for the minimum
+        supported widget version; if we're below it, sets upgrade_available so
+        the dashbar can surface the warning and the tray menu can offer a
+        "Download Update" item pointing at widgetReleasesUrl. Failures are
+        silent — version drift is non-urgent and a missing handshake
+        shouldn't disrupt the running widget."""
         try:
             r = requests.get(MEMBERSHIP_VERSION, timeout=10)
             r.raise_for_status()
             data = r.json().get("data", {})
             min_v = (data.get("widgetMinVersionName") or "").strip()
+            releases_url = (data.get("widgetReleasesUrl") or "").strip()
             if min_v and _ver_tuple(min_v) > _ver_tuple(WIDGET_VERSION):
                 with self._lock:
                     self.upgrade_available = True
                     self.upgrade_min_version = min_v
+                    self.upgrade_releases_url = releases_url
+                # Rebuild menus so the "Download Update" item appears now.
+                self.root.after(0, self._rebuild_context_menu)
                 self.root.after(0, self._update_display)
         except Exception:
             pass
+
+    def _schedule_widget_version_check(self):
+        """Run the version handshake immediately, then once per REFRESH_VERSION
+        seconds (24h). Without this a long-running widget would never see an
+        upgrade prompt — v2.0.x checked once at startup and never again."""
+        threading.Thread(target=self._fetch_widget_version, daemon=True).start()
+        self.root.after(REFRESH_VERSION * 1000, self._schedule_widget_version_check)
 
     def refresh_now(self):
         """Force an immediate refresh of all endpoints."""
@@ -602,6 +711,16 @@ class SoterianClock:
     def _render_display(self):
         with self._lock:
             sections = []
+
+            # Transient notice (e.g. token-revoked). Rendered first so it's
+            # the most prominent thing in the dashbar; auto-clears after
+            # NOTICE_TTL via the time check below.
+            if self.notice_text and self.notice_until:
+                if datetime.now(timezone.utc) < self.notice_until:
+                    sections.append(self.notice_text)
+                else:
+                    self.notice_text = ""
+                    self.notice_until = None
 
             # Gregorian date/time in user's chosen timezone
             if self.user_timezone and self.user_timezone != "System Default":
@@ -925,7 +1044,15 @@ class SoterianClock:
             )
 
         self.context_menu.add_separator()
-        self.context_menu.add_command(label="\U0001F310  Open Website", command=lambda: webbrowser.open(API_BASE))
+        self.context_menu.add_command(label="\U0001F4C5  Open Almanac", command=lambda: webbrowser.open(CELEBRATIONS_BASE))
+        self.context_menu.add_command(label="\U0001F310  Open time.soteriacovenant.org", command=lambda: webbrowser.open(API_BASE))
+        if self.upgrade_available:
+            self.context_menu.add_separator()
+            self.context_menu.add_command(
+                label=f"\u2b07  Download update (v{self.upgrade_min_version}+)",
+                command=lambda: webbrowser.open(self.upgrade_releases_url
+                                                or "https://github.com/SoteriaCovenantTrust/soterian-clock/releases"),
+            )
         self.context_menu.add_separator()
         self.context_menu.add_command(label="\u2715  Quit", command=self.quit_app)
 
