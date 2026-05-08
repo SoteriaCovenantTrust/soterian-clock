@@ -34,6 +34,7 @@ import time
 import signal
 import threading
 import platform
+import hashlib
 import shutil
 import subprocess
 import tarfile
@@ -106,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.5.0"
+WIDGET_VERSION = "2.5.1"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -917,6 +918,58 @@ class SoterianClock:
             self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
         self.root.after(0, self._update_display)
 
+    def _verify_tarball_sha256(self, tarball_path: Path, tarball_name: str, sums_url: str):
+        """Fetch the release's SHA256SUMS, look up the line for tarball_name,
+        and verify the local file's hash matches. Returns (ok, message).
+
+        If SHA256SUMS isn't published on the release (older releases predating
+        the CI step that started generating it), we skip with a log line and
+        return True — degrading gracefully so legacy releases stay
+        installable. The release-side enforcement is the new floor; older
+        releases just don't get the extra check.
+        """
+        try:
+            r = requests.get(sums_url, timeout=30)
+            if r.status_code == 404:
+                print(f"[soterian-clock] SHA256SUMS not published on this release "
+                      f"({sums_url}); proceeding without integrity check.",
+                      file=sys.stderr, flush=True)
+                return (True, "")
+            r.raise_for_status()
+        except requests.RequestException as e:
+            return (False, f"Couldn't fetch SHA256SUMS: {e}")
+
+        # Parse: each non-empty line is "<64-hex>  <filename>".
+        # Look up our specific tarball.
+        expected = None
+        for line in r.text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            h, name = parts[0].lower(), parts[1].lstrip("*").strip()
+            if name == tarball_name:
+                expected = h
+                break
+
+        if expected is None:
+            return (False, f"SHA256SUMS missing entry for {tarball_name}")
+
+        h = hashlib.sha256()
+        with open(tarball_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        actual = h.hexdigest().lower()
+
+        if actual != expected:
+            return (False,
+                    f"SHA256 mismatch — tarball does not match "
+                    f"published hash. Expected {expected[:16]}..., "
+                    f"got {actual[:16]}... (aborting)")
+        return (True, "")
+
     def _do_self_update(self, target_version: str):
         """Linux-only: download the matching release tarball from the public
         repo, extract, atomically swap the install dir, restart the systemd
@@ -937,8 +990,11 @@ class SoterianClock:
             return (False,
                     f"No matching x86_64 build for {arch}. Open the Releases page.")
 
-        url = (f"https://github.com/SoteriaCovenantTrust/soterian-clock/releases/download/"
-               f"v{target_version}/soterian-clock-{target_version}-linux-x86_64.tar.gz")
+        tarball_name = f"soterian-clock-{target_version}-linux-x86_64.tar.gz"
+        release_base = (f"https://github.com/SoteriaCovenantTrust/soterian-clock/"
+                        f"releases/download/v{target_version}")
+        url = f"{release_base}/{tarball_name}"
+        sums_url = f"{release_base}/SHA256SUMS"
 
         tarball_path = None
         staging = None
@@ -950,6 +1006,17 @@ class SoterianClock:
                 with open(tarball_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=65536):
                         f.write(chunk)
+
+            # Verify SHA256 against the release's published SHA256SUMS before
+            # extracting. Closes the gap where a corrupted download or a
+            # MITM that beat HTTPS would have been silently extracted. v2.5.0
+            # ran on bare HTTPS-trust; v2.5.1+ adds this check. If the
+            # SHA256SUMS file isn't on the release (older releases predating
+            # the CI step) we skip with a logged note rather than failing —
+            # so the auto-update path keeps working for legacy versions.
+            ok, msg = self._verify_tarball_sha256(tarball_path, tarball_name, sums_url)
+            if not ok:
+                return (False, msg)
 
             staging = Path(tempfile.mkdtemp(prefix="soterian-clock-extract-"))
             with tarfile.open(tarball_path) as tf:
