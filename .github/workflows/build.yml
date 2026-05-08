@@ -228,6 +228,107 @@ jobs:
             "dist/soterian-clock-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz" \
             -C dist soterian-clock
 
+      # ============================================================
+      # Code signing — scaffolded but inert until certs are provisioned.
+      # ============================================================
+      # macOS Gatekeeper and Windows SmartScreen reject unsigned binaries
+      # with scary warnings. The release tarballs run anyway (members can
+      # right-click → Open on macOS, click "More info → Run anyway" on
+      # Windows), but signing removes that friction.
+      #
+      # To enable signing later, add these repository secrets:
+      #
+      #   APPLE_DEVELOPER_ID         "Developer ID Application: ..."  identity
+      #   APPLE_SIGNING_CERT_BASE64  base64 of the .p12 cert+key
+      #   APPLE_SIGNING_CERT_PWD     password for the .p12
+      #   APPLE_NOTARIZE_USER        Apple ID email
+      #   APPLE_NOTARIZE_PWD         App-specific password
+      #   APPLE_NOTARIZE_TEAM        Team ID (10-char Apple Developer)
+      #
+      #   WINDOWS_CERT_BASE64        base64 of the EV code-signing cert (.pfx)
+      #   WINDOWS_CERT_PWD           password for the .pfx
+      #
+      # Cost: Apple Developer Program $99/yr; Windows EV cert $300+/yr.
+      # The steps below detect missing secrets and no-op cleanly so the
+      # build keeps succeeding for unsigned releases.
+
+      - name: Sign macOS binary (skipped if no cert)
+        if: matrix.platform == 'macos'
+        env:
+          APPLE_SIGNING_CERT_BASE64: ${{ secrets.APPLE_SIGNING_CERT_BASE64 }}
+          APPLE_SIGNING_CERT_PWD: ${{ secrets.APPLE_SIGNING_CERT_PWD }}
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+        run: |
+          if [ -z "$APPLE_SIGNING_CERT_BASE64" ] || [ -z "$APPLE_DEVELOPER_ID" ]; then
+            echo "::notice::macOS signing skipped — no APPLE_SIGNING_CERT_BASE64/APPLE_DEVELOPER_ID configured. Release will be unsigned (Gatekeeper warning on user side)."
+            exit 0
+          fi
+          # Import cert into a temporary keychain
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PWD="$(openssl rand -hex 32)"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -t 3600 -u "$KEYCHAIN"
+          echo "$APPLE_SIGNING_CERT_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_SIGNING_CERT_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN"
+          # Sign every Mach-O inside the bundle (PyInstaller bundles a lot
+          # of dylibs alongside the main binary; all need to be signed for
+          # the bundle to load post-Gatekeeper).
+          find dist/soterian-clock -type f \
+               \( -name "*.dylib" -o -name "*.so" -o -perm -u=x \) \
+               -exec codesign --force --options runtime \
+                              --sign "$APPLE_DEVELOPER_ID" --timestamp {} + 2>&1 | tail -5 || true
+          codesign --verify --verbose dist/soterian-clock/soterian-clock || true
+
+      - name: Notarize macOS bundle (skipped if no creds)
+        if: matrix.platform == 'macos'
+        env:
+          APPLE_NOTARIZE_USER: ${{ secrets.APPLE_NOTARIZE_USER }}
+          APPLE_NOTARIZE_PWD: ${{ secrets.APPLE_NOTARIZE_PWD }}
+          APPLE_NOTARIZE_TEAM: ${{ secrets.APPLE_NOTARIZE_TEAM }}
+        run: |
+          if [ -z "$APPLE_NOTARIZE_USER" ] || [ -z "$APPLE_NOTARIZE_TEAM" ]; then
+            echo "::notice::macOS notarization skipped — no APPLE_NOTARIZE_* configured."
+            exit 0
+          fi
+          ZIP="$RUNNER_TEMP/notarize.zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/soterian-clock "$ZIP"
+          xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_NOTARIZE_USER" \
+            --password "$APPLE_NOTARIZE_PWD" \
+            --team-id "$APPLE_NOTARIZE_TEAM" \
+            --wait
+          xcrun stapler staple dist/soterian-clock/soterian-clock || true
+
+      - name: Sign Windows binary (skipped if no cert)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PWD: ${{ secrets.WINDOWS_CERT_PWD }}
+        run: |
+          if (-not $env:WINDOWS_CERT_BASE64 -or -not $env:WINDOWS_CERT_PWD) {
+            Write-Host "::notice::Windows signing skipped — no WINDOWS_CERT_BASE64/WINDOWS_CERT_PWD configured. Release will be unsigned (SmartScreen warning on user side)."
+            exit 0
+          }
+          $certPath = "$env:RUNNER_TEMP\cert.pfx"
+          [System.IO.File]::WriteAllBytes($certPath,
+            [System.Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
+          $signtool = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe"
+          if (-not (Test-Path $signtool)) {
+            $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+                         Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          }
+          # Sign the main exe; PyInstaller doesn't typically generate signed
+          # auxiliary DLLs that need re-signing for SmartScreen reputation.
+          & $signtool sign /f $certPath /p $env:WINDOWS_CERT_PWD /fd sha256 `
+            /tr "http://timestamp.digicert.com" /td sha256 `
+            "dist\soterian-clock\soterian-clock.exe"
+          & $signtool verify /pa "dist\soterian-clock\soterian-clock.exe"
+
       - name: Package (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
