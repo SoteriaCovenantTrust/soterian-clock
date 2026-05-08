@@ -132,8 +132,86 @@ echo "The widget is running and will start automatically on each login."
 echo "  Status:  systemctl --user status soterian-clock"
 echo "  Logs:    journalctl --user -u soterian-clock -f"
 echo "  Stop:    systemctl --user disable --now soterian-clock"
+echo ""
+echo "Uninstall: bash $INSTALL_DIR/uninstall.sh"
 INSTALLER
         chmod +x dist/soterian-clock/install.sh
+
+        # Bundle uninstall.sh too — symmetric with install.sh, removes the
+        # systemd unit, the install dir, the symlink, and the keyring entry.
+        cat > dist/soterian-clock/uninstall.sh << 'UNINSTALLER'
+#!/usr/bin/env bash
+# Soterian Clock — Linux Uninstaller.
+# Reverses what install.sh did. Idempotent: safe to re-run.
+set -euo pipefail
+
+INSTALL_DIR="$HOME/.local/share/soterian-clock"
+BIN_LINK="$HOME/.local/bin/soterian-clock"
+UNIT="$HOME/.config/systemd/user/soterian-clock.service"
+SETTINGS_DIR="$HOME/.config/soterian-clock"
+
+echo "Uninstalling Soterian Clock..."
+
+# Stop + disable the systemd user unit (errors are fine — may already be gone)
+if systemctl --user list-unit-files 2>/dev/null | grep -q "^soterian-clock.service"; then
+    systemctl --user disable --now soterian-clock.service 2>/dev/null || true
+fi
+if [ -f "$UNIT" ]; then
+    rm -f "$UNIT"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo "  Removed systemd unit:  $UNIT"
+fi
+
+# Remove the install dir + symlink
+if [ -d "$INSTALL_DIR" ]; then
+    rm -rf "$INSTALL_DIR"
+    echo "  Removed install dir:  $INSTALL_DIR"
+fi
+if [ -L "$BIN_LINK" ]; then
+    rm -f "$BIN_LINK"
+    echo "  Removed symlink:      $BIN_LINK"
+fi
+
+# Remove the widget token from the OS keyring (best-effort: keyring may
+# not be installed system-wide; keyring CLI is `secret-tool` on libsecret).
+# We try secret-tool first, then python -c keyring as a fallback.
+KEYRING_REMOVED="no"
+if command -v secret-tool >/dev/null 2>&1; then
+    if secret-tool clear service soterian-clock username widget-token 2>/dev/null; then
+        KEYRING_REMOVED="yes"
+    fi
+fi
+if [ "$KEYRING_REMOVED" = "no" ] && command -v python3 >/dev/null 2>&1; then
+    python3 -c "
+try:
+    import keyring
+    keyring.delete_password('soterian-clock', 'widget-token')
+    print('  Removed keyring entry')
+except Exception:
+    pass
+" 2>/dev/null || true
+else
+    [ "$KEYRING_REMOVED" = "yes" ] && echo "  Removed keyring entry"
+fi
+
+# settings.json may hold non-token member metadata + position + ui_scale —
+# ask before deleting since the user may want to preserve preferences for
+# a future re-install.
+if [ -d "$SETTINGS_DIR" ]; then
+    echo ""
+    read -r -p "Also remove $SETTINGS_DIR (member metadata + window position + alert seen-set)? [y/N] " ans
+    if [ "${ans:-n}" = "y" ] || [ "${ans:-n}" = "Y" ]; then
+        rm -rf "$SETTINGS_DIR"
+        echo "  Removed settings dir: $SETTINGS_DIR"
+    else
+        echo "  Kept settings dir:    $SETTINGS_DIR"
+    fi
+fi
+
+echo ""
+echo "Done. Re-install with: bash install.sh (from a fresh tarball)."
+UNINSTALLER
+        chmod +x dist/soterian-clock/uninstall.sh
 
         tar -czf "$ARCHIVE" -C dist soterian-clock
         echo "Archive: $ARCHIVE ($(du -h "$ARCHIVE" | cut -f1))"

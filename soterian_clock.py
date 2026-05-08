@@ -107,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.5.1"
+WIDGET_VERSION = "2.6.0"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -384,6 +384,9 @@ def _create_tray_icon(clock_app):
     def on_install_update(icon, item):
         clock_app.root.after(0, clock_app.trigger_self_update)
 
+    def on_about(icon, item):
+        clock_app.root.after(0, clock_app._show_about_dialog)
+
     def on_quit(icon, item):
         icon.stop()
         clock_app.root.after(0, clock_app.quit_app)
@@ -437,6 +440,8 @@ def _create_tray_icon(clock_app):
             on_download_update,
             visible=lambda item: bool(clock_app.upgrade_latest_version),
         ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(lambda item: f"About v{WIDGET_VERSION}", on_about),
         pystray.MenuItem("Quit", on_quit),
     )
 
@@ -1154,9 +1159,18 @@ class SoterianClock:
             if celestial_parts:
                 sections.append(" \u00B7 ".join(celestial_parts))
 
-            # Member alias (when connected)
+            # Member alias + tier badge (when connected). Tier shown as
+            # "T0".."T4" — short enough to fit alongside the alias without
+            # bloating the dashbar; full tier names are in the right-click
+            # context menu's "Connected: X (Tier N – Name)" line.
             if self.is_connected and self.member_alias:
-                sections.append(f"\U0001F464 {self.member_alias}")
+                tier_str = ""
+                if self.member_tier is not None:
+                    try:
+                        tier_str = f" T{int(self.member_tier)}"
+                    except (TypeError, ValueError):
+                        tier_str = ""
+                sections.append(f"\U0001F464 {self.member_alias}{tier_str}")
 
             # Inbox badge — only when connected and there's actually unread.
             # Urgent count is appended with ❗ when > 0.
@@ -1371,6 +1385,68 @@ class SoterianClock:
         email_entry.focus_set()
 
         # Now center on screen after all widgets are packed
+        dialog.update_idletasks()
+        dw = dialog.winfo_reqwidth()
+        dh = dialog.winfo_reqheight()
+        x = (dialog.winfo_screenwidth() - dw) // 2
+        y = (dialog.winfo_screenheight() - dh) // 2
+        dialog.geometry(f"{dw}x{dh}+{x}+{y}")
+
+    def _show_about_dialog(self):
+        """Modal About dialog. Surfaces what's running so a member can paste
+        the version + commit info into a support thread without ssh-ing into
+        their box. Build info comes from constants only — no external probe,
+        so it works offline."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("About Soterian Clock")
+        dialog.configure(bg=BG_COLOR)
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+
+        frame = tk.Frame(dialog, bg=BG_COLOR, padx=24, pady=20)
+        frame.pack(fill="both", expand=True)
+
+        title = tk.Label(frame, text="\U0001F56F️  Soterian Clock",
+                         font=("Georgia", 14, "bold"),
+                         fg=FG_GOLD, bg=BG_COLOR)
+        title.pack(anchor="w")
+
+        sub = tk.Label(frame, text="Petrachora Soteria — desktop calendar widget",
+                       font=("Georgia", 10),
+                       fg=FG_TEXT, bg=BG_COLOR)
+        sub.pack(anchor="w", pady=(2, 14))
+
+        info_lines = [
+            ("Version", WIDGET_VERSION),
+            ("Platform", f"{platform.system()} {platform.machine()} ({platform.python_version()})"),
+            ("Calendar API", API_BASE),
+            ("Membership", MEMBERSHIP_BASE),
+            ("Almanac", CELEBRATIONS_BASE),
+            ("Connected as", self.member_alias if self.is_connected else "—"),
+            ("Member tier", f"T{self.member_tier}" if self.is_connected and self.member_tier is not None else "—"),
+            ("Timezone", self.user_timezone),
+        ]
+        for k, v in info_lines:
+            row = tk.Frame(frame, bg=BG_COLOR)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=f"{k}:", font=("Georgia", 9, "bold"),
+                     fg=FG_GOLD, bg=BG_COLOR, width=14, anchor="w").pack(side="left")
+            tk.Label(row, text=str(v), font=("Georgia", 9),
+                     fg=FG_TEXT, bg=BG_COLOR, anchor="w").pack(side="left")
+
+        tk.Frame(frame, bg=BORDER_COLOR, height=1).pack(fill="x", pady=(14, 10))
+
+        tk.Label(frame, text="Source: github.com/SoteriaCovenantTrust/soterian-clock (MIT)",
+                 font=("Georgia", 8), fg="#888", bg=BG_COLOR).pack(anchor="w")
+        tk.Label(frame, text="© Soteria Covenant Trust",
+                 font=("Georgia", 8), fg="#888", bg=BG_COLOR).pack(anchor="w")
+
+        btn = tk.Button(frame, text="Close", command=dialog.destroy,
+                        bg=FG_GOLD, fg=BG_COLOR, font=("Georgia", 10, "bold"),
+                        relief="flat", padx=20, pady=4)
+        btn.pack(pady=(14, 0))
+
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
         dialog.update_idletasks()
         dw = dialog.winfo_reqwidth()
         dh = dialog.winfo_reqheight()
