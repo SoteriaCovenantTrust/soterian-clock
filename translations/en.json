@@ -1,0 +1,48 @@
+{
+  "_meta": {
+    "language": "English",
+    "language_native": "English",
+    "language_code": "en",
+    "license": "MIT — match the widget's license",
+    "_note": "Source-of-truth file. All other locale files (de.json, fr.json, ...) should be a strict subset of these keys; missing keys fall back to English at runtime. Bump as new strings land."
+  },
+  "tray": {
+    "show_clock": "Show Clock",
+    "hide_clock": "Hide Clock",
+    "refresh_now": "Refresh Now",
+    "open_sites": "Open Soteria sites",
+    "open_sites_with_unread": "Open Soteria sites ({count})",
+    "site_almanac": "Almanac",
+    "site_inbox": "Inbox",
+    "site_inbox_with_unread": "Inbox ({count} unread)",
+    "site_time": "time.soteriacovenant.org",
+    "connect": "Connect to Membership...",
+    "disconnect": "Disconnect from Membership",
+    "connected_as": "Connected: {alias}",
+    "install_update": "⬇  Install update (v{version})",
+    "open_releases": "Open Releases page (v{version})",
+    "about": "About v{version}",
+    "quit": "Quit"
+  },
+  "notice": {
+    "connection_revoked": "⚠ Membership connection revoked — reconnect via menu",
+    "downloading_update": "⏬ Downloading update v{version}...",
+    "updated_from": "✓ Updated to v{new} (was v{old})"
+  },
+  "about": {
+    "title": "About Soterian Clock",
+    "subtitle": "Petrachora Soteria — desktop calendar widget",
+    "label_version": "Version",
+    "label_platform": "Platform",
+    "label_calendar_api": "Calendar API",
+    "label_membership": "Membership",
+    "label_almanac": "Almanac",
+    "label_connected_as": "Connected as",
+    "label_member_tier": "Member tier",
+    "label_timezone": "Timezone",
+    "not_connected": "—",
+    "close": "Close",
+    "footer_source": "Source: github.com/SoteriaCovenantTrust/soterian-clock (MIT)",
+    "footer_copyright": "© Soteria Covenant Trust"
+  }
+}
