@@ -27,7 +27,7 @@
   "notice": {
     "connection_revoked": "⚠ Membership connection revoked — reconnect via menu",
     "downloading_update": "⏬ Downloading update v{version}...",
-    "updated_from": "✓ Updated to v{new}",
+    "updated_from": "✓ v{new}",
     "first_run_hint": "Right-click for menu · Connect to Membership →"
   },
   "tier": {
