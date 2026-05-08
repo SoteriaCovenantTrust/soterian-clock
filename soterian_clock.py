@@ -107,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.8.0"
+WIDGET_VERSION = "2.9.0"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -415,13 +415,35 @@ def _create_tray_icon(clock_app):
     except ImportError:
         return None
 
-    # Draw a small gold circle on dark background as the tray icon
-    img = Image.new("RGBA", (64, 64), (13, 13, 13, 255))
-    draw = ImageDraw.Draw(img)
-    # Gold circle with dark border
-    draw.ellipse([8, 8, 56, 56], fill=(212, 175, 55, 255), outline=(90, 74, 58, 255), width=2)
-    # Small "S" hint via a simple line
-    draw.text((22, 14), "S", fill=(13, 13, 13, 255))
+    # Tray-icon variants per platform. The OS conventions differ:
+    #   macOS: NSStatusItem strongly prefers monochrome "template" images
+    #          that the OS auto-recolors for the menu-bar background
+    #          (light/dark mode + selected/unselected states). A colorful
+    #          icon looks out of place there.
+    #   Linux: trays vary wildly (GNOME/KDE/XFCE), but a colorful icon is
+    #          conventional and works in both bright and dark themes.
+    #   Windows: similar to Linux — tray icons are typically colorful.
+    # We draw a transparent-bg monochrome candle silhouette for macOS and
+    # the existing gold-circle-S for everywhere else. Both are 64×64 RGBA.
+    if _SYSTEM == "Darwin":
+        # Monochrome template — opaque pixels are recolored by NSStatusItem.
+        # We use solid black; macOS handles light/dark inversion.
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))  # transparent bg
+        draw = ImageDraw.Draw(img)
+        # Candle silhouette: vertical taper + flame teardrop on top.
+        # Body: rounded rectangle ~16 px wide, 28 px tall.
+        draw.rectangle([24, 22, 40, 50], fill=(0, 0, 0, 255))
+        # Flame: tear drop above the body.
+        draw.ellipse([26, 8, 38, 22], fill=(0, 0, 0, 255))
+        # Wick: short line connecting flame to body.
+        draw.rectangle([31, 18, 33, 24], fill=(0, 0, 0, 255))
+    else:
+        # Default: gold circle on dark with an "S" hint. Works in
+        # tray backgrounds of either contrast.
+        img = Image.new("RGBA", (64, 64), (13, 13, 13, 255))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse([8, 8, 56, 56], fill=(212, 175, 55, 255), outline=(90, 74, 58, 255), width=2)
+        draw.text((22, 14), "S", fill=(13, 13, 13, 255))
 
     def on_show(icon, item):
         clock_app.root.after(0, clock_app.show_window)
@@ -637,13 +659,23 @@ class SoterianClock:
         # restart that auto-update triggers kills the in-flight "✓ Updated"
         # notice from _do_self_update_thread, so this is the canonical signal.
         last_seen = (self._settings.get("last_known_version") or "").strip()
+        self._upgraded_from_version = ""  # for About dialog "What's new"
         if last_seen and last_seen != WIDGET_VERSION:
             try:
                 if _ver_tuple(WIDGET_VERSION) > _ver_tuple(last_seen):
-                    self.notice_text = _t("notice.updated_from", new=WIDGET_VERSION, old=last_seen)
+                    self._upgraded_from_version = last_seen
+                    self.notice_text = _t("notice.updated_from", new=WIDGET_VERSION)
                     self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
             except Exception:
                 pass
+        elif not last_seen and not bool(self.widget_token):
+            # First-time install hint — give a one-time nudge so a fresh
+            # member knows the right-click menu exists. Only when not yet
+            # connected (a connected widget already has the alias taking
+            # up that slot). Won't re-fire after restart because
+            # last_known_version is now set on this same startup.
+            self.notice_text = _t("notice.first_run_hint")
+            self.notice_until = datetime.now(timezone.utc) + timedelta(seconds=NOTICE_TTL)
         # Persist so the next startup can do the same comparison.
         if last_seen != WIDGET_VERSION:
             self._settings["last_known_version"] = WIDGET_VERSION
@@ -674,8 +706,50 @@ class SoterianClock:
         # Celestial-event alerts (4h cadence). Opt-out via settings.json.
         self._schedule_celestial_alerts()
 
+        # Suspend/resume listener (Linux). Subscribes to the systemd-logind
+        # PrepareForSleep dbus signal so the widget refreshes immediately on
+        # wake-from-sleep instead of waiting up to 60s for the next tick.
+        # No-op on macOS / Windows — both have native equivalents that we
+        # haven't wired up yet.
+        if _SYSTEM == "Linux":
+            self._start_suspend_resume_listener()
+
         # Start system tray
         self._start_tray()
+
+    def _start_suspend_resume_listener(self):
+        """Listen for `org.freedesktop.login1.Manager.PrepareForSleep` on
+        the system bus. The signal value is True before sleep and False
+        after resume — we trigger refresh_now on the resume edge so the
+        dashbar catches up immediately instead of showing stale time
+        until the next 60s poll. Runs in a background thread; failures
+        are silent (jeepney isn't available, no system bus, etc.)."""
+        def _listen():
+            try:
+                from jeepney import DBusAddress, MatchRule, message_bus
+                from jeepney.io.blocking import open_dbus_connection
+            except ImportError:
+                return  # jeepney not bundled — skip cleanly
+            try:
+                connection = open_dbus_connection(bus="SYSTEM")
+                rule = MatchRule(
+                    type="signal",
+                    sender="org.freedesktop.login1",
+                    interface="org.freedesktop.login1.Manager",
+                    member="PrepareForSleep",
+                )
+                connection.send_and_get_reply(message_bus.AddMatch(rule))
+                with connection.filter(rule) as queue:
+                    while True:
+                        msg = queue.get(timeout=None)
+                        # Body is (b,) — True=going to sleep, False=just woke
+                        if msg.body and len(msg.body) >= 1 and msg.body[0] is False:
+                            self.root.after(0, self.refresh_now)
+            except Exception as e:
+                print(f"[soterian-clock] suspend/resume listener stopped: {e!r}",
+                      file=sys.stderr, flush=True)
+
+        threading.Thread(target=_listen, daemon=True).start()
 
     def _build_ui(self):
         """Build the thin dashbar strip with gold accent."""
@@ -1263,15 +1337,19 @@ class SoterianClock:
             if celestial_parts:
                 sections.append(" \u00B7 ".join(celestial_parts))
 
-            # Member alias + tier badge (when connected). Tier shown as
-            # "T0".."T4" — short enough to fit alongside the alias without
-            # bloating the dashbar; full tier names are in the right-click
-            # context menu's "Connected: X (Tier N – Name)" line.
+            # Member alias + tier name (when connected). Tier as the human
+            # name ("Steward") rather than "T4" — costs a few chars but is
+            # actually informative; previously a member would see "T4" and
+            # wonder what tier 4 means. Falls back to bare "Tn" if the
+            # translation is missing.
             if self.is_connected and self.member_alias:
                 tier_str = ""
                 if self.member_tier is not None:
                     try:
-                        tier_str = f" T{int(self.member_tier)}"
+                        n = int(self.member_tier)
+                        name = _t(f"tier.{n}")
+                        # _t returns the dotted key on miss; detect that as fallback
+                        tier_str = f" · {name}" if name and not name.startswith("tier.") else f" T{n}"
                     except (TypeError, ValueError):
                         tier_str = ""
                 sections.append(f"\U0001F464 {self.member_alias}{tier_str}")
@@ -1496,6 +1574,50 @@ class SoterianClock:
         y = (dialog.winfo_screenheight() - dh) // 2
         dialog.geometry(f"{dw}x{dh}+{x}+{y}")
 
+    def _fetch_whats_new_into_label(self, label, target_version: str):
+        """Pull the CHANGELOG section for `target_version` from the public
+        repo and stuff it into the given Tk label. Runs in a background
+        thread; UI mutations marshalled via root.after."""
+        url = (f"https://raw.githubusercontent.com/SoteriaCovenantTrust/"
+               f"soterian-clock/main/CHANGELOG.md")
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            section = self._extract_changelog_section(r.text, target_version)
+        except Exception as e:
+            section = f"(Couldn't load CHANGELOG: {e})"
+
+        def _apply():
+            try:
+                label.config(text=section)
+            except Exception:
+                pass  # label may have been destroyed if user closed dialog
+        self.root.after(0, _apply)
+
+    @staticmethod
+    def _extract_changelog_section(md: str, version: str) -> str:
+        """Pull the Keep-a-Changelog section for `version` (matching either
+        `## [vX.Y.Z]` or `## [X.Y.Z]`) until the next `##` heading. Returns
+        plain-text body trimmed; returns a polite placeholder if not found."""
+        import re
+        # Match `## [2.9.0]` or `## [v2.9.0]` then capture body until next ##
+        pattern = re.compile(
+            r"^##\s*\[v?" + re.escape(version) + r"\][^\n]*\n(.*?)(?=^##\s)",
+            re.MULTILINE | re.DOTALL,
+        )
+        m = pattern.search(md)
+        if not m:
+            return f"(No CHANGELOG section found for v{version}.)"
+        body = m.group(1).strip()
+        # Trim to keep the dialog reasonable: at most ~25 lines, ~1500 chars.
+        lines = body.splitlines()
+        if len(lines) > 25:
+            lines = lines[:24] + ["…"]
+        body = "\n".join(lines)
+        if len(body) > 1500:
+            body = body[:1480] + "…"
+        return body
+
     def _show_about_dialog(self):
         """Modal About dialog. Surfaces what's running so a member can paste
         the version + commit info into a support thread without ssh-ing into
@@ -1527,7 +1649,11 @@ class SoterianClock:
             ("Membership", MEMBERSHIP_BASE),
             ("Almanac", CELEBRATIONS_BASE),
             ("Connected as", self.member_alias if self.is_connected else "—"),
-            ("Member tier", f"T{self.member_tier}" if self.is_connected and self.member_tier is not None else "—"),
+            ("Member tier", (
+                _t(f"tier.{int(self.member_tier)}")
+                if self.is_connected and self.member_tier is not None
+                else "—"
+            )),
             ("Timezone", self.user_timezone),
         ]
         for k, v in info_lines:
@@ -1537,6 +1663,26 @@ class SoterianClock:
                      fg=FG_GOLD, bg=BG_COLOR, width=14, anchor="w").pack(side="left")
             tk.Label(row, text=str(v), font=("Georgia", 9),
                      fg=FG_TEXT, bg=BG_COLOR, anchor="w").pack(side="left")
+
+        # "What's new in this version" — only when we just upgraded.
+        # Body comes from a background fetch of the public CHANGELOG; we
+        # render a placeholder first and replace once the fetch lands so
+        # the dialog opens fast even on slow networks.
+        if self._upgraded_from_version:
+            tk.Frame(frame, bg=BORDER_COLOR, height=1).pack(fill="x", pady=(14, 8))
+            tk.Label(frame,
+                     text=f"What's new in v{WIDGET_VERSION} (since v{self._upgraded_from_version})",
+                     font=("Georgia", 9, "bold"),
+                     fg=FG_GOLD, bg=BG_COLOR).pack(anchor="w")
+            whats_new = tk.Label(frame, text="Loading from CHANGELOG...",
+                                 font=("Georgia", 8), fg="#bbb", bg=BG_COLOR,
+                                 justify="left", anchor="w", wraplength=480)
+            whats_new.pack(anchor="w", fill="x", pady=(4, 0))
+            threading.Thread(
+                target=self._fetch_whats_new_into_label,
+                args=(whats_new, WIDGET_VERSION),
+                daemon=True,
+            ).start()
 
         tk.Frame(frame, bg=BORDER_COLOR, height=1).pack(fill="x", pady=(14, 10))
 

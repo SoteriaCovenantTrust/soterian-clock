@@ -41,6 +41,11 @@ a = Analysis(
         'keyring.backends.SecretService',  # Linux (libsecret)
         'keyring.backends.macOS',           # macOS (Keychain)
         'keyring.backends.Windows',         # Windows (Credential Locker)
+        # Suspend/resume listener (Linux). jeepney is pulled in transitively
+        # by keyring's secretstorage backend so this just makes sure
+        # PyInstaller bundles the io.blocking subpackage we import lazily.
+        'jeepney',
+        'jeepney.io.blocking',
     ],
     hookspath=[],
     hooksconfig={},

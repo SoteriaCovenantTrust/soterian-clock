@@ -27,7 +27,15 @@
   "notice": {
     "connection_revoked": "⚠ Membership connection revoked — reconnect via menu",
     "downloading_update": "⏬ Downloading update v{version}...",
-    "updated_from": "✓ Updated to v{new} (was v{old})"
+    "updated_from": "✓ Updated to v{new}",
+    "first_run_hint": "Right-click for menu · Connect to Membership →"
+  },
+  "tier": {
+    "0": "Beneficiary",
+    "1": "Junior Trustee",
+    "2": "Administrator",
+    "3": "Senior Trustee",
+    "4": "Steward"
   },
   "about": {
     "title": "About Soterian Clock",
