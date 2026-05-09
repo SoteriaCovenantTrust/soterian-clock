@@ -138,6 +138,36 @@ jobs:
           WantedBy=graphical-session.target
           EOF
 
+          # Daily diagnostic — runs `soterian-clock --diagnostic` once per day.
+          # Failures show up as a `failed` systemd user unit; combined with the
+          # widget's own startup self-test, surfaces silent degradation within
+          # ~24h instead of waiting for visual notice.
+          cat > "$SYSTEMD_USER_DIR/soterian-clock-diagnostic.service" << EOF
+          [Unit]
+          Description=Soterian Clock daily self-check
+
+          [Service]
+          Type=oneshot
+          ExecStart=$INSTALL_DIR/soterian-clock --diagnostic
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=soterian-clock-diagnostic
+          EOF
+
+          cat > "$SYSTEMD_USER_DIR/soterian-clock-diagnostic.timer" << EOF
+          [Unit]
+          Description=Run Soterian Clock --diagnostic daily
+
+          [Timer]
+          OnCalendar=daily
+          Persistent=true
+          RandomizedDelaySec=30min
+          Unit=soterian-clock-diagnostic.service
+
+          [Install]
+          WantedBy=timers.target
+          EOF
+
           if [ -f "$OLD_AUTOSTART" ]; then
             mv "$OLD_AUTOSTART" "$OLD_AUTOSTART.bak"
             echo "Retired old XDG autostart: $OLD_AUTOSTART -> ${OLD_AUTOSTART}.bak"
@@ -145,6 +175,7 @@ jobs:
 
           systemctl --user daemon-reload
           systemctl --user enable --now soterian-clock.service
+          systemctl --user enable --now soterian-clock-diagnostic.timer
 
           echo ""
           echo "Installed to:  $INSTALL_DIR"
