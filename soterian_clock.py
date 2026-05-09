@@ -107,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.9.2"
+WIDGET_VERSION = "2.9.3"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -188,6 +188,37 @@ def _t(key: str, **kwargs) -> str:
             except (KeyError, IndexError):
                 return node
     return key  # truly missing — leak the key so it's debuggable
+
+
+def _compute_hidpi_scale(ppi: float, screen_width: int,
+                         current_scaling: float, override: float = 0.0):
+    """Decide what `tk scaling` value (if any) to apply for a HiDPI display.
+
+    Pure function so it can be unit-tested without a live Tk root. Called
+    from SoterianClock.__init__ before any widget is built.
+
+    The widget went silently tiny on lid-open / reboot more than once for
+    different reasons rooted in Wayland + mutter's xwayland-native-scaling:
+      - **Case A (v2.1.1 fix)**: mutter reports the actual physical mm
+        (~410mm) to xwayland → Tk's `winfo_fpixels('1i')` reads ~190.
+        Heuristic: ppi > 120, scale = ppi / 72.
+      - **Case B (v2.9.3 fix)**: mutter reports an inflated "logical" mm
+        (~813mm for the same screen) → ppi reads ~96, looking deceptively
+        normal. But screen_width is still the real 3072 px, and Tk's
+        default scaling (~1.33) is below what a real HiDPI display needs.
+        Heuristic: screen_width ≥ 2560 AND current_scaling < 1.6 → scale = 2.0.
+
+    Manual `ui_scale` setting in settings.json always wins.
+
+    Returns the new scale to apply, or None if no change needed.
+    """
+    if override and override > 0:
+        return override
+    if ppi > 120:
+        return ppi / 72.0
+    if screen_width >= 2560 and current_scaling < 1.6:
+        return 2.0
+    return None
 
 
 def _ver_tuple(v: str) -> tuple:
@@ -573,22 +604,17 @@ class SoterianClock:
 
         # HiDPI awareness — must run before any widget is built so font
         # sizes (specified in points) get the right point-to-pixel ratio.
-        # Tk defaults to ~96 DPI; on a HiDPI display under Wayland with
-        # mutter's xwayland-native-scaling enabled (GNOME default for some
-        # configs as of 2026), the X11 server reports the true native
-        # resolution and Tk renders the dashbar roughly half-size unless
-        # we apply the scale ourselves. We honour an explicit override in
-        # settings.json ("ui_scale") for users who want to force a value;
-        # otherwise we infer from winfo_fpixels and only scale up if the
-        # screen is meaningfully HiDPI (>120 DPI).
+        # See _compute_hidpi_scale for the heuristic; this block just wires
+        # it to the live Tk root.
         try:
-            override = float(_safe_read_json(SETTINGS_PATH, default={}).get("ui_scale") or 0)
-            if override > 0:
-                self.root.tk.call('tk', 'scaling', override)
-            else:
-                ppi = self.root.winfo_fpixels('1i')  # pixels per inch
-                if ppi > 120:
-                    self.root.tk.call('tk', 'scaling', ppi / 72.0)
+            override_raw = _safe_read_json(SETTINGS_PATH, default={}).get("ui_scale")
+            override = float(override_raw) if override_raw else 0.0
+            ppi = self.root.winfo_fpixels('1i')
+            screen_w = self.root.winfo_screenwidth()
+            current_scaling = float(self.root.tk.call('tk', 'scaling'))
+            new_scale = _compute_hidpi_scale(ppi, screen_w, current_scaling, override)
+            if new_scale is not None:
+                self.root.tk.call('tk', 'scaling', new_scale)
         except Exception as e:
             print(f"[soterian-clock] HiDPI scaling probe failed: {e!r}",
                   file=sys.stderr, flush=True)

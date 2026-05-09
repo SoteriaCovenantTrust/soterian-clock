@@ -403,3 +403,58 @@ class TestTranslate:
         # Either falls back to raw template or substitutes empty — both are fine
         # as long as we don't raise.
         assert isinstance(result, str)
+
+
+# ============================================================================
+# HiDPI heuristic — both cases the widget went silently tiny on
+# ============================================================================
+
+class TestComputeHidpiScale:
+    """Regression tests for the two real-world tiny-widget cases."""
+
+    def test_no_change_for_normal_hd_screen(self):
+        # 1920×1080, no override, default Tk scaling — leave alone.
+        assert sc._compute_hidpi_scale(96, 1920, 1.0, 0) is None
+
+    def test_case_a_high_ppi_reported(self):
+        # Mutter reports physical mm correctly → Tk reads ~190 ppi.
+        # Heuristic: scale = ppi / 72.
+        result = sc._compute_hidpi_scale(190, 3072, 1.33, 0)
+        assert result is not None
+        assert abs(result - 190.0 / 72.0) < 0.001
+
+    def test_case_b_inflated_mm_reported(self):
+        # Real maintainer machine state on 2026-05-09 reboot:
+        # 3072×1728 physical, but Tk reads mm=813 → ppi=96.
+        # Case A heuristic doesn't fire (ppi <= 120).
+        # Case B heuristic catches it via screen_width.
+        assert sc._compute_hidpi_scale(96, 3072, 1.33, 0) == 2.0
+
+    def test_already_scaled_no_double_scale(self):
+        # If user has somehow already gotten Tk to scale to 2.0,
+        # don't re-scale on top.
+        assert sc._compute_hidpi_scale(96, 3072, 2.0, 0) is None
+
+    def test_just_under_screen_width_threshold(self):
+        # 1080p stretched a bit (still no HiDPI) — don't trigger Case B.
+        assert sc._compute_hidpi_scale(96, 2559, 1.0, 0) is None
+
+    def test_at_screen_width_threshold(self):
+        # 2560 is the QHD threshold — Case B should fire.
+        assert sc._compute_hidpi_scale(96, 2560, 1.0, 0) == 2.0
+
+    def test_override_always_wins_over_case_a(self):
+        # User says 1.5 even though we'd auto-pick ppi/72 ≈ 2.6.
+        assert sc._compute_hidpi_scale(190, 3072, 1.33, override=1.5) == 1.5
+
+    def test_override_always_wins_over_case_b(self):
+        # User says 2.5 even though Case B would pick 2.0.
+        assert sc._compute_hidpi_scale(96, 3072, 1.33, override=2.5) == 2.5
+
+    def test_override_zero_treated_as_unset(self):
+        # 0.0 means "no override", not "scale to 0x".
+        assert sc._compute_hidpi_scale(96, 1920, 1.0, override=0.0) is None
+
+    def test_negative_override_ignored(self):
+        # Defensive: garbage override value falls through to auto-detect.
+        assert sc._compute_hidpi_scale(96, 1920, 1.0, override=-1.0) is None
