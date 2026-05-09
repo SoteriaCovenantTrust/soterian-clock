@@ -107,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.9.4"
+WIDGET_VERSION = "2.9.5"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -792,7 +792,7 @@ class SoterianClock:
         are silent (jeepney isn't available, no system bus, etc.)."""
         def _listen():
             try:
-                from jeepney import DBusAddress, MatchRule, message_bus
+                from jeepney import MatchRule, message_bus
                 from jeepney.io.blocking import open_dbus_connection
             except ImportError:
                 return  # jeepney not bundled — skip cleanly
@@ -805,12 +805,18 @@ class SoterianClock:
                     member="PrepareForSleep",
                 )
                 connection.send_and_get_reply(message_bus.AddMatch(rule))
-                with connection.filter(rule) as queue:
-                    while True:
-                        msg = queue.get(timeout=None)
-                        # Body is (b,) — True=going to sleep, False=just woke
-                        if msg.body and len(msg.body) >= 1 and msg.body[0] is False:
-                            self.root.after(0, self.refresh_now)
+                # jeepney 0.9 — recv_until_filtered blocks for the next
+                # signal that matches the rule; the deque-from-`filter()`
+                # pattern requires a separate reader thread to be useful,
+                # which is exactly the bug the v2.9.0 implementation hit.
+                while True:
+                    msg = connection.recv_until_filtered(rule)
+                    # Body is (b,) — True before sleep, False on resume.
+                    # Refresh on the resume edge so the dashbar catches up
+                    # immediately instead of waiting up to 60s for the next
+                    # tick.
+                    if msg.body and len(msg.body) >= 1 and msg.body[0] is False:
+                        self.root.after(0, self.refresh_now)
             except Exception as e:
                 print(f"[soterian-clock] suspend/resume listener stopped: {e!r}",
                       file=sys.stderr, flush=True)
