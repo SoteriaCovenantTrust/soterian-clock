@@ -167,6 +167,39 @@ SyslogIdentifier=soterian-clock
 WantedBy=graphical-session.target
 EOF
 
+# Daily diagnostic — runs `soterian-clock --diagnostic` once a day and
+# captures the report to journald. Failures (any check returning non-OK)
+# show up as a `failed` systemd user unit, which the maintainer's
+# morning-brief routine catches via `systemctl --user --failed`.
+# Closes the silent-degradation gap: connection breaks, keyring
+# inaccessible, calendar API down, etc. surface within ~24h instead of
+# whenever the user happens to look at the dashbar.
+cat > "$SYSTEMD_USER_DIR/soterian-clock-diagnostic.service" << EOF
+[Unit]
+Description=Soterian Clock daily self-check
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/soterian-clock --diagnostic
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=soterian-clock-diagnostic
+EOF
+
+cat > "$SYSTEMD_USER_DIR/soterian-clock-diagnostic.timer" << EOF
+[Unit]
+Description=Run Soterian Clock --diagnostic daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30min
+Unit=soterian-clock-diagnostic.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 # Retire any pre-2.0.3 XDG autostart entry so the widget doesn't double-launch
 if [ -f "$OLD_AUTOSTART" ]; then
     mv "$OLD_AUTOSTART" "$OLD_AUTOSTART.bak"
@@ -176,6 +209,7 @@ fi
 # Reload + enable + start
 systemctl --user daemon-reload
 systemctl --user enable --now soterian-clock.service
+systemctl --user enable --now soterian-clock-diagnostic.timer
 
 echo ""
 echo "Installed to:  $INSTALL_DIR"
@@ -183,9 +217,10 @@ echo "Symlink:       $BIN_LINK"
 echo "Systemd unit:  $SYSTEMD_USER_DIR/soterian-clock.service"
 echo ""
 echo "The widget is running and will start automatically on each login."
-echo "  Status:  systemctl --user status soterian-clock"
-echo "  Logs:    journalctl --user -u soterian-clock -f"
-echo "  Stop:    systemctl --user disable --now soterian-clock"
+echo "  Status:    systemctl --user status soterian-clock"
+echo "  Logs:      journalctl --user -u soterian-clock -f"
+echo "  Stop:      systemctl --user disable --now soterian-clock"
+echo "  Diagnose:  soterian-clock --diagnostic   (also runs daily via timer)"
 echo ""
 echo "Uninstall: bash $INSTALL_DIR/uninstall.sh"
 INSTALLER
@@ -202,19 +237,26 @@ set -euo pipefail
 INSTALL_DIR="$HOME/.local/share/soterian-clock"
 BIN_LINK="$HOME/.local/bin/soterian-clock"
 UNIT="$HOME/.config/systemd/user/soterian-clock.service"
+DIAG_SVC="$HOME/.config/systemd/user/soterian-clock-diagnostic.service"
+DIAG_TIMER="$HOME/.config/systemd/user/soterian-clock-diagnostic.timer"
 SETTINGS_DIR="$HOME/.config/soterian-clock"
 
 echo "Uninstalling Soterian Clock..."
 
-# Stop + disable the systemd user unit (errors are fine — may already be gone)
-if systemctl --user list-unit-files 2>/dev/null | grep -q "^soterian-clock.service"; then
-    systemctl --user disable --now soterian-clock.service 2>/dev/null || true
-fi
-if [ -f "$UNIT" ]; then
-    rm -f "$UNIT"
-    systemctl --user daemon-reload 2>/dev/null || true
-    echo "  Removed systemd unit:  $UNIT"
-fi
+# Stop + disable the systemd user unit + the daily diagnostic timer
+# (errors are fine — units may already be gone if a prior uninstall ran).
+for u in soterian-clock-diagnostic.timer soterian-clock-diagnostic.service soterian-clock.service; do
+    if systemctl --user list-unit-files 2>/dev/null | grep -q "^${u}"; then
+        systemctl --user disable --now "$u" 2>/dev/null || true
+    fi
+done
+for f in "$UNIT" "$DIAG_SVC" "$DIAG_TIMER"; do
+    if [ -f "$f" ]; then
+        rm -f "$f"
+        echo "  Removed systemd unit:  $f"
+    fi
+done
+systemctl --user daemon-reload 2>/dev/null || true
 
 # Remove the install dir + symlink
 if [ -d "$INSTALL_DIR" ]; then

@@ -107,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.9.3"
+WIDGET_VERSION = "2.9.4"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -742,6 +742,46 @@ class SoterianClock:
 
         # Start system tray
         self._start_tray()
+
+        # Self-test: 500ms after launch (giving Tk time to compute geometry),
+        # check whether we ended up rendering tiny on a high-res screen.
+        # Logs to stderr → journald → morning-brief grep can catch silent
+        # rendering bugs without waiting for the user to notice visually.
+        # Closes the bug class we hit twice (HiDPI Cases A and B).
+        self.root.after(500, self._self_test_render_size)
+
+    def _self_test_render_size(self):
+        """Sanity-check the dashbar's actual rendered size against the
+        screen dimensions. If it looks tiny on a high-res screen, we
+        almost certainly missed a HiDPI scale and should warn loudly so
+        an operator (or the morning-brief routine) can react before the
+        user notices.
+
+        No automatic remediation — the right fix is in
+        `_compute_hidpi_scale`, which we'd want to extend with a new
+        signal rather than patch over the symptom at runtime.
+        """
+        try:
+            self.root.update_idletasks()
+            screen_w = self.root.winfo_screenwidth()
+            widget_h = self.root.winfo_height()
+            widget_w = self.root.winfo_width()
+            current_scaling = float(self.root.tk.call("tk", "scaling"))
+            # Tiny-widget signature: high-res screen, but rendered height < 25 px
+            # (real dashbar at 1x is ~30 px; under HiDPI scaling it's ~50–60).
+            if screen_w >= 2560 and widget_h > 0 and widget_h < 25:
+                print(
+                    f"[soterian-clock] WARN: dashbar rendered tiny "
+                    f"({widget_w}x{widget_h} px on a {screen_w}-wide screen, "
+                    f"tk scaling={current_scaling:.2f}). Suspect HiDPI miss — "
+                    f"see _compute_hidpi_scale for heuristics, or set "
+                    f"\"ui_scale\": 2.0 in settings.json to force.",
+                    file=sys.stderr, flush=True,
+                )
+        except Exception as e:
+            # Self-test must never crash the widget itself.
+            print(f"[soterian-clock] self-test failed: {e!r}",
+                  file=sys.stderr, flush=True)
 
     def _start_suspend_resume_listener(self):
         """Listen for `org.freedesktop.login1.Manager.PrepareForSleep` on
