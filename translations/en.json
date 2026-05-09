@@ -37,6 +37,19 @@
     "3": "Senior Trustee",
     "4": "Steward"
   },
+  "connect": {
+    "window_title": "Connect to Membership",
+    "heading": "Connect to Soteria Membership",
+    "subhead": "Sign in with your membership credentials",
+    "email_label": "Email:",
+    "password_label": "Password:",
+    "btn_connect": "Connect",
+    "btn_cancel": "Cancel",
+    "err_both_required": "Both fields are required",
+    "status_connecting": "Connecting…",
+    "err_default": "Connection failed",
+    "err_network": "Connection error. Check your network."
+  },
   "about": {
     "title": "About Soterian Clock",
     "subtitle": "Petrachora Soteria — desktop calendar widget",

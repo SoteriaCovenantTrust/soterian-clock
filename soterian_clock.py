@@ -107,7 +107,7 @@ CELEBRATIONS_BASE = "https://almanac.soteriacovenant.org"
 # Local widget build version. Compared against widgetMinVersionName from the
 # membership /version endpoint to surface "upgrade available" in the dashbar
 # when the server has moved past the supported floor.
-WIDGET_VERSION = "2.9.1"
+WIDGET_VERSION = "2.9.2"
 
 # How often to re-poll /api/v1/version. A widget left running for weeks
 # would never see the upgrade prompt without this, since the v2 launch-time
@@ -1463,7 +1463,7 @@ class SoterianClock:
     def _show_connect_dialog(self):
         """Show a dialog for email + password login to Membership."""
         dialog = tk.Toplevel(self.root)
-        dialog.title("Connect to Membership")
+        dialog.title(_t("connect.window_title"))
         dialog.configure(bg=BG_COLOR)
 
         # Let tkinter auto-size from content, no fixed geometry
@@ -1475,21 +1475,21 @@ class SoterianClock:
         # Let content determine size, then center
         dialog.update_idletasks()
 
-        tk.Label(dialog, text="Connect to Soteria Membership",
+        tk.Label(dialog, text=_t("connect.heading"),
                  font=("Georgia", 14, "bold"), fg=FG_GOLD, bg=BG_COLOR
                  ).pack(pady=(20, 5))
-        tk.Label(dialog, text="Sign in with your membership credentials",
+        tk.Label(dialog, text=_t("connect.subhead"),
                  font=("Georgia", 10), fg=FG_DIM, bg=BG_COLOR
                  ).pack(pady=(0, 15))
 
         # Email
-        tk.Label(dialog, text="Email:", font=("Georgia", 11),
+        tk.Label(dialog, text=_t("connect.email_label"), font=("Georgia", 11),
                  fg=FG_TEXT, bg=BG_COLOR, anchor="w").pack(fill="x", padx=40)
         email_entry = tk.Entry(dialog, font=("Georgia", 11), width=35)
         email_entry.pack(padx=40, pady=(2, 10))
 
         # Password
-        tk.Label(dialog, text="Password:", font=("Georgia", 11),
+        tk.Label(dialog, text=_t("connect.password_label"), font=("Georgia", 11),
                  fg=FG_TEXT, bg=BG_COLOR, anchor="w").pack(fill="x", padx=40)
         pass_entry = tk.Entry(dialog, font=("Georgia", 11), width=35, show="\u2022")
         pass_entry.pack(padx=40, pady=(2, 10))
@@ -1503,9 +1503,9 @@ class SoterianClock:
             email = email_entry.get().strip()
             password = pass_entry.get()
             if not email or not password:
-                status_label.config(text="Both fields are required", fg="#bb4444")
+                status_label.config(text=_t("connect.err_both_required"), fg="#bb4444")
                 return
-            status_label.config(text="Connecting\u2026", fg=FG_DIM)
+            status_label.config(text=_t("connect.status_connecting"), fg=FG_DIM)
             dialog.update()
 
             # Run in background thread
@@ -1518,7 +1518,7 @@ class SoterianClock:
                     }, timeout=10)
                     data = r.json()
                     if r.status_code != 200 or data.get("status") != "success":
-                        err = data.get("error", {}).get("message", "Connection failed")
+                        err = data.get("error", {}).get("message", _t("connect.err_default"))
                         dialog.after(0, lambda: status_label.config(text=err, fg="#bb4444"))
                         return
 
@@ -1549,16 +1549,16 @@ class SoterianClock:
 
                 except (requests.RequestException, ValueError, KeyError) as e:
                     dialog.after(0, lambda: status_label.config(
-                        text="Connection error. Check your network.", fg="#bb4444"))
+                        text=_t("connect.err_network"), fg="#bb4444"))
 
             threading.Thread(target=_connect, daemon=True).start()
 
         btn_frame = tk.Frame(dialog, bg=BG_COLOR)
         btn_frame.pack(pady=(0, 15))
-        tk.Button(btn_frame, text="Connect", command=do_connect,
+        tk.Button(btn_frame, text=_t("connect.btn_connect"), command=do_connect,
                   bg=FG_GOLD, fg=BG_COLOR, font=("Georgia", 11, "bold"),
                   relief="flat", padx=20, pady=5).pack(side="left", padx=8)
-        tk.Button(btn_frame, text="Cancel", command=dialog.destroy,
+        tk.Button(btn_frame, text=_t("connect.btn_cancel"), command=dialog.destroy,
                   bg="#333", fg=FG_TEXT, font=("Georgia", 11),
                   relief="flat", padx=20, pady=5).pack(side="left", padx=8)
 
@@ -1577,22 +1577,50 @@ class SoterianClock:
     def _fetch_whats_new_into_label(self, label, target_version: str):
         """Pull the CHANGELOG section for `target_version` from the public
         repo and stuff it into the given Tk label. Runs in a background
-        thread; UI mutations marshalled via root.after."""
+        thread; UI mutations marshalled via root.after.
+
+        Cached to settings.json (`whats_new_cache: {version, body, fetched_at}`)
+        with a 24h TTL — re-opening About is free for the rest of the day.
+        Cache is keyed by version, so an upgrade busts it automatically."""
+        # Cache hit: same version, fetched within last 24h
+        cache = self._settings.get("whats_new_cache") or {}
+        if (cache.get("version") == target_version
+                and isinstance(cache.get("body"), str)
+                and isinstance(cache.get("fetched_at"), str)):
+            try:
+                fetched_at = datetime.fromisoformat(cache["fetched_at"])
+                if datetime.now(timezone.utc) - fetched_at < timedelta(hours=24):
+                    section = cache["body"]
+                    self.root.after(0, lambda: self._set_label_text(label, section))
+                    return
+            except (ValueError, TypeError):
+                pass  # stale/malformed cache → re-fetch
+
         url = (f"https://raw.githubusercontent.com/SoteriaCovenantTrust/"
                f"soterian-clock/main/CHANGELOG.md")
         try:
             r = requests.get(url, timeout=15)
             r.raise_for_status()
             section = self._extract_changelog_section(r.text, target_version)
+            # Cache the result
+            with self._lock:
+                self._settings["whats_new_cache"] = {
+                    "version": target_version,
+                    "body": section,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                }
+                _safe_write_json(SETTINGS_PATH, self._settings)
         except Exception as e:
             section = f"(Couldn't load CHANGELOG: {e})"
 
-        def _apply():
-            try:
-                label.config(text=section)
-            except Exception:
-                pass  # label may have been destroyed if user closed dialog
-        self.root.after(0, _apply)
+        self.root.after(0, lambda: self._set_label_text(label, section))
+
+    @staticmethod
+    def _set_label_text(label, text):
+        try:
+            label.config(text=text)
+        except Exception:
+            pass  # label may have been destroyed if user closed dialog
 
     @staticmethod
     def _extract_changelog_section(md: str, version: str) -> str:
@@ -1889,12 +1917,136 @@ def _cli_upgrade() -> int:
     return 0 if ok else 2
 
 
+def _cli_diagnostic() -> int:
+    """Headless self-check: probes every external dependency and prints a
+    paste-able report. Use when something's off and you'd like a member to
+    send their machine's view of the world without screensharing.
+
+    Exits 0 if everything checked OK, 1 if any major check failed.
+    """
+    import shutil as _sh
+    out = []
+    def line(s=""): out.append(s)
+
+    line("=" * 60)
+    line(f"Soterian Clock diagnostic — v{WIDGET_VERSION}")
+    line("=" * 60)
+    line()
+    line(f"Platform:    {platform.system()} {platform.machine()} ({platform.python_version()})")
+    line(f"Settings:    {SETTINGS_PATH}")
+    line(f"Lockfile:    {LOCKFILE}")
+    line()
+
+    failures = 0
+
+    # 1. Calendar API reachability
+    line("[1/5] Calendar API")
+    try:
+        r = requests.get(f"{API_BASE}/api/ping", timeout=5)
+        line(f"  GET {API_BASE}/api/ping → HTTP {r.status_code} in {r.elapsed.total_seconds():.2f}s")
+        if r.status_code != 200:
+            failures += 1
+            line("  ✗ unexpected status")
+        else:
+            line("  ✓ ok")
+    except Exception as e:
+        failures += 1
+        line(f"  ✗ {e!r}")
+
+    # 2. Membership /version
+    line()
+    line("[2/5] Membership /api/v1/version")
+    try:
+        r = requests.get(MEMBERSHIP_VERSION, timeout=10)
+        d = r.json().get("data", {}) if r.ok else {}
+        line(f"  GET {MEMBERSHIP_VERSION} → HTTP {r.status_code}")
+        line(f"  engineVersion:       {d.get('engineVersion', '?')}")
+        line(f"  widgetVersionName:   {d.get('widgetVersionName', '?')}")
+        line(f"  widgetMinVersionName:{d.get('widgetMinVersionName', '?')}")
+        latest = (d.get("widgetVersionName") or "").strip()
+        if latest and _ver_tuple(latest) > _ver_tuple(WIDGET_VERSION):
+            line(f"  ⓘ  upgrade available: v{latest}")
+        else:
+            line("  ✓ ok")
+    except Exception as e:
+        failures += 1
+        line(f"  ✗ {e!r}")
+
+    # 3. Token storage (keyring vs settings.json fallback)
+    line()
+    line("[3/5] Token storage")
+    kr = _keyring_module()
+    if kr is None:
+        line("  ⓘ  python keyring module not bundled; using settings.json fallback")
+    else:
+        try:
+            backend = kr.get_keyring()
+            line(f"  Backend: {type(backend).__name__}")
+            # Probe write+read+delete with a sentinel value
+            kr.set_password(_KEYRING_SERVICE, "diag-probe", "ok")
+            v = kr.get_password(_KEYRING_SERVICE, "diag-probe")
+            kr.delete_password(_KEYRING_SERVICE, "diag-probe")
+            if v == "ok":
+                line("  ✓ keyring read/write/delete works")
+            else:
+                failures += 1
+                line(f"  ✗ keyring round-trip mismatch (got {v!r})")
+        except Exception as e:
+            line(f"  ⚠ keyring write failed (will fall back to settings.json): {e!r}")
+    has_token = bool(_load_widget_token())
+    line(f"  Connected:  {'yes' if has_token else 'no'}")
+
+    # 4. systemd user unit (Linux only)
+    line()
+    line("[4/5] systemd user unit (Linux only)")
+    if _SYSTEM != "Linux":
+        line(f"  ⓘ  skipped — {_SYSTEM} doesn't use systemd")
+    elif not _sh.which("systemctl"):
+        line("  ⓘ  systemctl not found — likely not systemd-managed")
+    else:
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "is-active", "soterian-clock.service"],
+                capture_output=True, text=True, timeout=5,
+            )
+            line(f"  is-active: {res.stdout.strip() or '(no output)'}")
+            if res.stdout.strip() != "active":
+                line("  ⓘ  not running under systemd (might be launched another way)")
+            else:
+                line("  ✓ active")
+        except Exception as e:
+            line(f"  ⚠ {e!r}")
+
+    # 5. Translations dir present
+    line()
+    line("[5/5] Translations")
+    tdir = _translations_dir()
+    if tdir.exists() and (tdir / "en.json").exists():
+        files = sorted(p.name for p in tdir.glob("*.json"))
+        line(f"  Dir:      {tdir}")
+        line(f"  Locales:  {', '.join(files)}")
+        line(f"  Detected: {_detect_language()}")
+        line("  ✓ ok")
+    else:
+        failures += 1
+        line(f"  ✗ translations dir missing: {tdir}")
+
+    line()
+    line("=" * 60)
+    line(f"Result: {'OK' if failures == 0 else f'{failures} failure(s)'}")
+    line("=" * 60)
+    print("\n".join(out))
+    return 0 if failures == 0 else 1
+
+
 if __name__ == "__main__":
-    # Headless --upgrade short-circuits before any Tk / lockfile dance —
-    # it's safe to run while the regular widget is also running, since
-    # the systemctl restart at the end will swap in the new binary.
+    # Headless --upgrade and --diagnostic short-circuit before any Tk /
+    # lockfile dance — both are safe to run while the regular widget is
+    # also running.
     if "--upgrade" in sys.argv:
         sys.exit(_cli_upgrade())
+    if "--diagnostic" in sys.argv or "--diagnose" in sys.argv:
+        sys.exit(_cli_diagnostic())
 
     if already_running():
         print("Soterian Clock is already running.")

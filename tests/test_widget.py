@@ -252,3 +252,154 @@ class TestVerifyTarballSha256:
                 tarball, tarball.name, "https://example.invalid/SHA256SUMS")
 
         assert ok is True
+
+
+# ============================================================================
+# CHANGELOG section extraction (drives the About → "What's new" panel)
+# ============================================================================
+
+CHANGELOG_FIXTURE = """\
+# Changelog
+
+## [2.9.2] - 2026-05-08 — Diagnostic CLI
+
+### Added
+- `--diagnostic` CLI flag.
+- Connect dialog i18n.
+
+## [2.9.1] - 2026-05-08 — Shorter notice
+
+### Changed
+- Truncated post-update notice.
+
+## [2.9.0] - 2026-05-08 — Tier name + first-run hint
+
+### Added
+- Tier name in dashbar.
+- First-run install hint.
+"""
+
+
+class TestExtractChangelogSection:
+    extract = staticmethod(sc.SoterianClock._extract_changelog_section)
+
+    def test_extracts_matching_version(self):
+        body = self.extract(CHANGELOG_FIXTURE, "2.9.1")
+        assert "Truncated post-update notice" in body
+        # Should NOT bleed into the next section
+        assert "Tier name in dashbar" not in body
+
+    def test_extracts_first_section(self):
+        body = self.extract(CHANGELOG_FIXTURE, "2.9.2")
+        assert "Diagnostic CLI" in body or "--diagnostic" in body
+        assert "Connect dialog i18n" in body
+        assert "Truncated post-update notice" not in body
+
+    def test_handles_v_prefix(self):
+        # Pattern matches both `## [v2.9.2]` and `## [2.9.2]` shapes.
+        md_v = CHANGELOG_FIXTURE.replace("[2.9.1]", "[v2.9.1]")
+        body = self.extract(md_v, "2.9.1")
+        assert "Truncated" in body
+
+    def test_missing_version_returns_polite_fallback(self):
+        body = self.extract(CHANGELOG_FIXTURE, "9.9.9")
+        assert "9.9.9" in body
+        # Defensive: should not be empty, should mention the version
+        assert len(body) > 0
+
+    def test_trims_to_25_lines_max(self):
+        # Build a CHANGELOG with one section of 50 bullet lines
+        big = ["## [3.0.0] - 2026-05-08 — Big release", ""]
+        for i in range(50):
+            big.append(f"- bullet {i}")
+        big.append("")
+        big.append("## [2.9.2] - 2026-05-08 — Earlier")
+        body = self.extract("\n".join(big), "3.0.0")
+        # Body should be trimmed; ellipsis or fewer lines than original
+        lines = body.splitlines()
+        assert len(lines) <= 25
+        # The trim is supposed to add an ellipsis line
+        assert "…" in body or len(body) <= 1500
+
+
+# ============================================================================
+# Language detection (settings override → LANG env → "en" fallback)
+# ============================================================================
+
+class TestDetectLanguage:
+    def test_default_to_en_when_nothing_set(self, tmp_path, monkeypatch):
+        settings = tmp_path / "settings.json"
+        monkeypatch.setattr(sc, "SETTINGS_PATH", settings)
+        monkeypatch.delenv("LANG", raising=False)
+        monkeypatch.delenv("LC_ALL", raising=False)
+        assert sc._detect_language() == "en"
+
+    def test_settings_language_override_wins(self, tmp_path, monkeypatch):
+        settings = tmp_path / "settings.json"
+        settings.write_text('{"language": "fr"}')
+        monkeypatch.setattr(sc, "SETTINGS_PATH", settings)
+        monkeypatch.setenv("LANG", "de_DE.UTF-8")  # should be ignored
+        sc._TRANSLATIONS_CACHE.clear()
+        assert sc._detect_language() == "fr"
+
+    def test_env_lang_used_when_no_settings_override(self, tmp_path, monkeypatch):
+        settings = tmp_path / "settings.json"
+        # Settings exists but no language key
+        settings.write_text('{"other_key": "x"}')
+        monkeypatch.setattr(sc, "SETTINGS_PATH", settings)
+        monkeypatch.setenv("LANG", "fr_CA.UTF-8")
+        sc._TRANSLATIONS_CACHE.clear()
+        assert sc._detect_language() == "fr"
+
+    def test_env_lc_all_falls_back_when_no_lang(self, tmp_path, monkeypatch):
+        settings = tmp_path / "settings.json"
+        monkeypatch.setattr(sc, "SETTINGS_PATH", settings)
+        monkeypatch.delenv("LANG", raising=False)
+        monkeypatch.setenv("LC_ALL", "ja_JP.UTF-8")
+        assert sc._detect_language() == "ja"
+
+    def test_env_strips_underscore_and_dot(self, tmp_path, monkeypatch):
+        settings = tmp_path / "settings.json"
+        monkeypatch.setattr(sc, "SETTINGS_PATH", settings)
+        monkeypatch.setenv("LANG", "pt_BR")  # no .UTF-8
+        assert sc._detect_language() == "pt"
+
+
+# ============================================================================
+# _t() — translation with fallback chain
+# ============================================================================
+
+class TestTranslate:
+    def test_existing_key_returns_translation(self, monkeypatch):
+        # Force English so we know what string we'll get
+        monkeypatch.setattr(sc, "_detect_language", lambda: "en")
+        sc._TRANSLATIONS_CACHE.clear()
+        assert sc._t("tray.show_clock") == "Show Clock"
+
+    def test_kwarg_substitution(self, monkeypatch):
+        monkeypatch.setattr(sc, "_detect_language", lambda: "en")
+        sc._TRANSLATIONS_CACHE.clear()
+        assert sc._t("tray.about", version="9.9.9") == "About v9.9.9"
+
+    def test_missing_key_returns_key_itself(self, monkeypatch):
+        monkeypatch.setattr(sc, "_detect_language", lambda: "en")
+        sc._TRANSLATIONS_CACHE.clear()
+        # Use a definitely-not-in-en.json key
+        assert sc._t("does.not.exist.anywhere") == "does.not.exist.anywhere"
+
+    def test_unknown_lang_falls_back_to_english(self, monkeypatch):
+        monkeypatch.setattr(sc, "_detect_language", lambda: "xx-not-real")
+        sc._TRANSLATIONS_CACHE.clear()
+        assert sc._t("tray.quit") == "Quit"
+
+    def test_safe_when_kwargs_missing(self, monkeypatch):
+        # If .format() raises KeyError, we should return the raw template
+        # rather than crashing the caller. Useful for translations that have
+        # placeholder mismatches.
+        monkeypatch.setattr(sc, "_detect_language", lambda: "en")
+        sc._TRANSLATIONS_CACHE.clear()
+        # Call without the version kwarg the template wants
+        result = sc._t("tray.about")
+        # Either falls back to raw template or substitutes empty — both are fine
+        # as long as we don't raise.
+        assert isinstance(result, str)
